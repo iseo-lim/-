@@ -1,6 +1,6 @@
 'use strict';
 /**
- * 사내 요청 창구 — 서버
+ * 사내 요청 창구 — 서버 (MVP: 요청 접수 · 우선순위 회의 · 버전 관리 · 권한)
  * 외부 패키지 없이 Node.js 20 이상에서 실행: node server.js  (테스트 모드 예시 데이터: node server.js --seed)
  */
 const http = require('node:http');
@@ -17,18 +17,35 @@ const DB_PATH = path.join(DATA_DIR, 'db.json');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const SESSION_COOKIE = 'rq_sid';
 
+// 상태·유형·우선순위는 task-management 「티켓 관리 규칙 v2」의 보드 칸과 라벨을 따라요
 const ENUMS = {
-  platforms: ['앱', '웹', '키오스크', '기타'],
-  types: ['버그·오류', '기능 개선', '신규 기능', '디자인', '데이터·운영 지원', '기타'],
+  platforms: ['앱', '바리스온', '키오스크', '기타'],
+  types: ['버그', '신규 기능', '기능 개선', '운영 지원', '논의 필요'],
+  typeHints: {
+    '버그': '동작이 잘못됐어요',
+    '신규 기능': '없던 기능이 필요해요',
+    '기능 개선': '있는 기능을 바꾸거나 낫게 해 주세요',
+    '운영 지원': '설정·데이터·문구 변경, 정리 같은 운영 업무예요',
+    '논의 필요': '바로 진행하기 전에 함께 정해야 해요',
+  },
   jobs: ['기획', '개발', '디자인'],
   levels: ['상', '중', '하'],
-  statuses: ['접수', '진행 예정', '진행 중', '완료', '보류', '반려'],
-  priorities: ['P0', 'P1', 'P2', 'P3'],
-  taskStatuses: ['할 일', '진행 중', '리뷰', '완료'],
-  epicColors: ['#4a6fa5', '#2f8f83', '#7a5bb8', '#b8693a', '#a8456f', '#5a7a2c'],
+  statuses: ['접수', '백로그', '기획·디자인', '개발 대기', '개발', 'QA', '배포 대기', '완료', '보류', '반려'],
+  priorities: ['P0', 'P1', 'P2', 'P3'], // 내부 값. 화면에는 priorityLabels만 보여요
+  priorityLabels: { P0: '즉시 대응', P1: '높음', P2: '보통', P3: '낮음' },
+  priorityHints: { P0: '하던 일을 멈추고 바로 처리해요', P1: '이번 스프린트 안에 해결해요', P2: '곧 해결해요', P3: '여유 있을 때 해요' },
+  versionPlatforms: ['앱', '바리스온', '키오스크'],
+  versionStatuses: ['계획', '개발 중', 'QA', '배포 대기', '배포 완료', '취소'],
 };
 const STATUS_NEEDS_REASON = new Set(['보류', '반려']);
-const ASSIGNEE_STATUSES = new Set(['진행 예정', '진행 중', '완료']);
+// 담당자가 직접 옮길 수 있는 상태 (접수·보류·반려는 우선순위 회의 몫)
+const ASSIGNEE_STATUSES = new Set(['백로그', '기획·디자인', '개발 대기', '개발', 'QA', '배포 대기', '완료']);
+const DONE_STATUSES = new Set(['완료', '반려', '보류']);
+// GitHub 라벨 (task-management 라벨 체계)
+const GH_TYPE = { '버그': 'bug', '신규 기능': 'feature', '기능 개선': 'improvement', '운영 지원': 'chore', '논의 필요': 'discussion' };
+const GH_PRIORITY = { P0: 'critical', P1: 'high', P2: 'medium', P3: 'low' };
+const DEFAULT_PROJECT_LABELS = { '앱': 'project: Lounge(x) APP', '바리스온': 'project: BarisON', '키오스크': 'project: X KIOSK' };
+const prioLabel = (p) => (p ? ENUMS.priorityLabels[p] : '미정');
 const IMG_TYPES = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp' };
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -37,18 +54,18 @@ const MIME = {
 };
 
 // ───────────────────────── 권한 ─────────────────────────
+const PERM_SCHEMA = 3; // 권한 항목이 바뀌면 올려서, 예전 권한 표를 기본값으로 되돌려요
 const PERMS = [
   { key: 'request.viewAll', label: '모든 팀의 요청 보기' },
   { key: 'request.triage', label: '우선순위 회의 진행 (우선순위·담당자 지정, 보류·반려)' },
-  { key: 'work.view', label: '작업 관리 보기 (스프린트 보드·백로그·에픽)' },
-  { key: 'work.edit', label: '작업 만들기·수정·상태 변경 (담당자 후보가 돼요)' },
-  { key: 'work.plan', label: '스프린트·에픽 관리, 작업 삭제' },
-  { key: 'admin', label: '권한 관리, 알림 기록, 연동 관리' },
+  { key: 'request.handle', label: '요청 처리 담당 (담당자 후보가 되고, 맡은 요청의 상태를 바꿔요)' },
+  { key: 'version.manage', label: '버전 등록·수정, 요청 담기, 배포 완료 처리' },
+  { key: 'admin', label: '권한 관리, 알림 기록' },
 ];
 const PERM_KEYS = PERMS.map((p) => p.key);
 const ROLES = [
   { id: 'admin', name: '관리자', desc: '모든 권한을 가져요.' },
-  { id: 'lead', name: '리드', desc: '우선순위 회의를 진행하고 스프린트·에픽을 계획해요.' },
+  { id: 'lead', name: '리드', desc: '우선순위 회의를 진행하고 배포를 관리해요.' },
   { id: 'member', name: '작업자', desc: '기획·개발·디자인 실무자예요.' },
   { id: 'opsLead', name: '운영 리드', desc: '운영 쪽 대표로 우선순위 회의에 참여해요.' },
   { id: 'requester', name: '요청자', desc: '요청을 등록하고 자기 팀 요청을 봐요.' },
@@ -56,8 +73,8 @@ const ROLES = [
 const ROLE_IDS = ROLES.map((r) => r.id);
 const DEFAULT_ROLE_PERMS = {
   admin: PERM_KEYS,
-  lead: ['request.viewAll', 'request.triage', 'work.view', 'work.edit', 'work.plan'],
-  member: ['request.viewAll', 'work.view', 'work.edit'],
+  lead: ['request.viewAll', 'request.triage', 'request.handle', 'version.manage'],
+  member: ['request.viewAll', 'request.handle', 'version.manage'],
   opsLead: ['request.viewAll', 'request.triage'],
   requester: [],
 };
@@ -79,8 +96,7 @@ function loadConfig() {
   c.github.token = process.env.GITHUB_TOKEN || c.github.token || '';
   c.github.apiUrl = (process.env.GITHUB_API_URL || c.github.apiUrl || 'https://api.github.com').replace(/\/$/, '');
   c.github.repoByPlatform = c.github.repoByPlatform || {};
-  c.github.repos = c.github.repos || [];
-  c.github.pollSeconds = Math.max(15, Number(process.env.GITHUB_POLL_SECONDS || c.github.pollSeconds || 60));
+  c.github.projectLabels = c.github.projectLabels || {};
   c.slack = c.slack || {};
   c.slack.webhookUrl = process.env.SLACK_WEBHOOK_URL || c.slack.webhookUrl || '';
   c.slack.botToken = process.env.SLACK_BOT_TOKEN || c.slack.botToken || '';
@@ -95,13 +111,38 @@ function loadConfig() {
 
 // ───────────────────────── 저장소 (JSON 파일) ─────────────────────────
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// 화면에 찍히는 메시지를 data/server.log에도 남겨요 (창이 닫혀도 원인을 볼 수 있게)
+const LOG_PATH = path.join(DATA_DIR, 'server.log');
+for (const level of ['log', 'warn', 'error']) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => {
+    orig(...args);
+    const line = args.map((a) => (a instanceof Error ? a.stack : typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    try { fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${level.toUpperCase()} ${line}\n`); } catch { /* 기록 실패는 무시 */ }
+  };
+}
+process.on('uncaughtException', (e) => { console.error('[치명적 오류]', e); process.exit(1); });
+
 let db = {
-  seq: 0, taskSeq: 0, epicSeq: 0, sprintSeq: 0,
-  requests: [], tasks: [], epics: [], sprints: [],
-  users: {}, sessions: {}, notifications: [],
-  roleOverrides: {}, rolePerms: null, ghSync: {},
+  seq: 0, versionSeq: 0, requests: [], versions: [],
+  users: {}, sessions: {}, notifications: [], roleOverrides: {}, rolePerms: null, permSchema: PERM_SCHEMA,
 };
 if (fs.existsSync(DB_PATH)) db = { ...db, ...JSON.parse(fs.readFileSync(DB_PATH, 'utf8')) };
+if (db.permSchema !== PERM_SCHEMA) { db.rolePerms = null; db.permSchema = PERM_SCHEMA; }
+// 예전 이름 → 새 규칙 이름 (여러 번 돌아도 결과가 같아요)
+const RENAME = {
+  status: { '진행 예정': '백로그', '진행 중': '개발' },
+  type: { '버그·오류': '버그', '디자인': '기능 개선', '데이터·운영 지원': '운영 지원', '기타': '논의 필요' },
+  platform: { '웹': '바리스온' },
+};
+for (const r of db.requests) {
+  if (!Array.isArray(r.versionIds)) r.versionIds = [];
+  r.status = RENAME.status[r.status] || r.status;
+  r.type = RENAME.type[r.type] || r.type;
+  r.platforms = r.platforms.map((p) => RENAME.platform[p] || p);
+}
+for (const v of db.versions || []) v.platform = RENAME.platform[v.platform] || v.platform;
 
 let saveChain = Promise.resolve();
 function save() {
@@ -125,7 +166,6 @@ const isDate = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
 const pickList = (v, allowed) => (Array.isArray(v) ? [...new Set(v.filter((x) => allowed.includes(x)))] : []);
 const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
 const who = (u) => ({ memberId: u.memberId, name: u.name });
-const sumPoints = (list) => list.reduce((s, t) => s + (Number(t.points) || 0), 0);
 const userName = (id) => (db.users[id] ? db.users[id].name : id);
 
 function httpError(status, message) {
@@ -189,12 +229,12 @@ function checkCsrf(req) {
 }
 
 // ───────────────────────── 사용자·권한 ─────────────────────────
-// 통합계정 권한그룹(permGroupIds) → 팀·직군·역할
 function legacyRole(m) {
   if (m.scope === 'all') return m.triage ? 'lead' : 'member';
   return m.triage ? 'opsLead' : 'requester';
 }
 
+// 통합계정 권한그룹(permGroupIds) → 팀·직군·역할
 function resolveGroups(groupIds) {
   const matched = (Array.isArray(groupIds) ? groupIds : [])
     .filter((g) => cfg.groupMap[g])
@@ -203,17 +243,16 @@ function resolveGroups(groupIds) {
   const roles = [...new Set(matched.map((m) => (ROLE_IDS.includes(m.role) ? m.role : legacyRole(m))))];
   const primary = matched.find((m) => m.job && m.job !== '운영') || matched[0];
   return {
-    team: primary.team || '',
-    job: primary.job || '',
+    team: primary.team || '', job: primary.job || '',
     teams: [...new Set(matched.map((m) => m.team).filter(Boolean))],
-    ssoRoles: roles,
-    groups: matched.map((m) => m.id),
+    ssoRoles: roles, groups: matched.map((m) => m.id),
   };
 }
 
 function rolePermsTable() {
-  const t = { ...DEFAULT_ROLE_PERMS, ...(db.rolePerms || {}) };
-  t.admin = PERM_KEYS;
+  const stored = db.rolePerms || {};
+  const t = {};
+  for (const r of ROLE_IDS) t[r] = r === 'admin' ? PERM_KEYS : pickList(stored[r] !== undefined ? stored[r] : DEFAULT_ROLE_PERMS[r], PERM_KEYS);
   return t;
 }
 function rolesOf(u) {
@@ -239,10 +278,7 @@ function upsertUser(info, { login = true } = {}) {
   let photoUrl = null;
   if (info.photoUrl) photoUrl = /^https?:\/\//.test(info.photoUrl) ? info.photoUrl : cfg.sso.baseUrl + info.photoUrl;
   const u = {
-    memberId: info.memberId,
-    name: info.memberName || info.memberId,
-    email: info.email || '',
-    photoUrl,
+    memberId: info.memberId, name: info.memberName || info.memberId, email: info.email || '', photoUrl,
     team: '', job: '', teams: [], ssoRoles: [], groups: [],
     ...(g || {}),
     firstLoginAt: prev.firstLoginAt || (login ? now() : null),
@@ -253,10 +289,7 @@ function upsertUser(info, { login = true } = {}) {
 }
 
 const publicUser = (u) =>
-  u && {
-    memberId: u.memberId, name: u.name, team: u.team, teams: u.teams, job: u.job, photoUrl: u.photoUrl,
-    roles: rolesOf(u), perms: [...permsOf(u)],
-  };
+  u && { memberId: u.memberId, name: u.name, team: u.team, teams: u.teams, job: u.job, photoUrl: u.photoUrl, roles: rolesOf(u), perms: [...permsOf(u)] };
 
 function currentUser(req) {
   const sid = parseCookies(req)[SESSION_COOKIE];
@@ -304,10 +337,7 @@ async function ssoComplete(tempToken) {
   let r;
   try {
     r = await fetch(cfg.sso.baseUrl + '/api/auth/login/complete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tempToken }),
-      signal: AbortSignal.timeout(10000),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tempToken }), signal: AbortSignal.timeout(10000),
     });
   } catch (e) {
     console.error('[SSO] 통합계정 서버 연결 실패:', e.message);
@@ -335,38 +365,39 @@ async function handleLogin(req, res) {
 
 function handleLogout(req, res) {
   const sid = parseCookies(req)[SESSION_COOKIE];
-  if (sid && db.sessions[sha(sid)]) {
-    delete db.sessions[sha(sid)];
-    save();
-  }
+  if (sid && db.sessions[sha(sid)]) { delete db.sessions[sha(sid)]; save(); }
   res.setHeader('Set-Cookie', sessionCookie('', 0));
   send(res, 200, { ok: true });
 }
 
 // ───────────────────────── 요청 ─────────────────────────
-const commentCount = (list) => list.filter((t) => t.type === 'comment').length;
-const tasksOf = (r) => db.tasks.filter((t) => t.requestId === r.id);
+// 숫자로 시작하는 버전은 v를 붙여 보여줘요 (2.3.1 → v2.3.1, 바리스온 월 단위 2026-11은 그대로)
+const versionName = (s) => (/^\d+\.\d+/.test(s) ? 'v' + s : s);
+const versionLabel = (v) => `${v.platform} ${versionName(v.version)}`;
+const versionsOf = (r) => r.versionIds.map((id) => db.versions.find((v) => v.id === id)).filter(Boolean);
+const versionBrief = (v) => ({ id: v.id, platform: v.platform, version: v.version, status: v.status, plannedDate: v.plannedDate, releasedDate: v.releasedDate });
 
 function listItem(r) {
   const { timeline, ...rest } = r;
-  const tasks = tasksOf(r);
-  return { ...rest, commentCount: commentCount(timeline), taskStats: { total: tasks.length, done: tasks.filter((t) => t.status === '완료').length } };
+  return { ...rest, commentCount: timeline.filter((t) => t.type === 'comment').length, versions: versionsOf(r).map(versionBrief) };
 }
 
 // 다른 팀 요청: 보드에서 대기열만 보이도록 요약 정보만 전달
 function summaryItem(r) {
   return {
     id: r.id, title: r.title, status: r.status, priority: r.priority, platforms: r.platforms, type: r.type, jobs: r.jobs,
-    requesterTeam: r.requesterTeam, assignees: r.assignees, createdAt: r.createdAt, updatedAt: r.updatedAt, restricted: true,
+    requesterTeam: r.requesterTeam, assignees: r.assignees, createdAt: r.createdAt, updatedAt: r.updatedAt,
+    versions: versionsOf(r).map(versionBrief), restricted: true,
   };
 }
 
 function detailFor(u, r) {
   const triage = can(u, 'request.triage');
+  const assignee = r.assignees.includes(u.memberId);
   return {
     ...r,
-    tasks: tasksOf(r).sort((a, b) => a.id - b.id).map((t) => ({ id: t.id, key: t.key, title: t.title, status: t.status, assignee: t.assignee, job: t.job, points: t.points })),
-    perms: { triage, status: triage || r.assignees.includes(u.memberId), addTask: can(u, 'work.edit') },
+    versions: versionsOf(r).map(versionBrief),
+    perms: { triage, status: triage || assignee, versions: triage || assignee || can(u, 'version.manage') },
   };
 }
 
@@ -423,7 +454,7 @@ async function createRequest(u, b) {
     id: ++db.seq, title, platforms, type, jobs, description, reproSteps, dueDate,
     urgency, urgencyReason, importance, importanceReason, attachments,
     requester: { memberId: u.memberId, name: u.name, team: u.team }, requesterTeam: u.team,
-    status: '접수', statusReason: '', priority: null, assignees: [], targetVersion: '',
+    status: '접수', statusReason: '', priority: null, assignees: [], versionIds: [],
     github: null, createdAt: at, updatedAt: at,
     timeline: [{ type: 'created', at, by: who(u) }],
   };
@@ -435,10 +466,28 @@ async function createRequest(u, b) {
   return r;
 }
 
+// 요청에 담을 버전 검증: 존재 · 취소 아님 · 플랫폼당 하나
+function parseVersionIds(r, ids) {
+  if (!Array.isArray(ids)) throw httpError(400, '반영 버전 값이 올바르지 않아요.');
+  const list = [...new Set(ids.map(Number))].map((id) => {
+    const v = db.versions.find((x) => x.id === id);
+    if (!v) throw httpError(400, '없는 버전이에요.');
+    return v;
+  });
+  const seen = new Set();
+  for (const v of list) {
+    if (seen.has(v.platform)) throw httpError(400, `${v.platform} 버전은 하나만 고를 수 있어요.`);
+    seen.add(v.platform);
+    if (v.status === '취소' && !r.versionIds.includes(v.id)) throw httpError(400, `${versionLabel(v)}은(는) 취소된 버전이에요.`);
+  }
+  return list.map((v) => v.id);
+}
+
 async function updateRequest(u, r, b) {
   const triage = can(u, 'request.triage');
   const assignee = r.assignees.includes(u.memberId);
-  if (!triage && !assignee) throw httpError(403, '이 요청을 변경할 권한이 없어요.');
+  const versionPerm = triage || assignee || can(u, 'version.manage');
+  if (!triage && !assignee && !versionPerm) throw httpError(403, '이 요청을 변경할 권한이 없어요.');
   const triageOnly = (field) => {
     if (!triage) throw httpError(403, `${field} 변경은 우선순위 회의 권한이 있어야 해요.`);
   };
@@ -455,19 +504,23 @@ async function updateRequest(u, r, b) {
     if (!sameSet(j, r.jobs)) { triageOnly('담당 직군'); changes.push({ type: 'jobs', from: r.jobs, to: j }); }
   }
   if (b.assignees !== undefined) {
-    const a = Array.isArray(b.assignees) ? [...new Set(b.assignees.filter((id) => typeof id === 'string' && db.users[id]))] : [];
+    const a = Array.isArray(b.assignees) ? [...new Set(b.assignees.filter((id) => typeof id === 'string' && db.users[id] && can(db.users[id], 'request.handle')))] : [];
     if (!sameSet(a, r.assignees)) { triageOnly('담당자'); changes.push({ type: 'assignees', from: r.assignees, to: a }); }
   }
-  if (b.targetVersion !== undefined) {
-    const v = str(b.targetVersion, 40);
-    if (v !== r.targetVersion) changes.push({ type: 'version', from: r.targetVersion, to: v });
+  if (b.versionIds !== undefined) {
+    const ids = parseVersionIds(r, b.versionIds);
+    if (!sameSet(ids, r.versionIds)) {
+      if (!versionPerm) throw httpError(403, '반영 버전을 바꿀 권한이 없어요.');
+      changes.push({ type: 'versions', from: r.versionIds, to: ids });
+    }
   }
   let status = b.status;
-  // 접수 상태에서 우선순위가 확정되면 자동으로 '진행 예정'
-  if ((status === undefined || status === r.status) && r.status === '접수' && changes.some((c) => c.type === 'priority' && c.to)) status = '진행 예정';
+  // 접수 상태에서 우선순위가 확정되면 자동으로 '백로그' (보드 규칙: 해야 할 일로 인지됨)
+  if ((status === undefined || status === r.status) && r.status === '접수' && changes.some((c) => c.type === 'priority' && c.to)) status = '백로그';
   if (status !== undefined && status !== r.status) {
     if (!ENUMS.statuses.includes(status)) throw httpError(400, '상태 값이 올바르지 않아요.');
-    if (!triage && !ASSIGNEE_STATUSES.has(status)) throw httpError(403, '담당자는 진행 예정·진행 중·완료로만 바꿀 수 있어요.');
+    if (!triage && !assignee) throw httpError(403, '상태를 바꿀 권한이 없어요.');
+    if (!triage && !ASSIGNEE_STATUSES.has(status)) throw httpError(403, '보류·반려는 우선순위 회의 권한이 있어야 해요.');
     const reason = str(b.statusReason, 1000);
     if (STATUS_NEEDS_REASON.has(status) && !reason) throw httpError(400, `${status} 사유를 입력해 주세요.`);
     changes.push({ type: 'status', from: r.status, to: status, reason });
@@ -475,17 +528,19 @@ async function updateRequest(u, r, b) {
   await applyRequestChanges(r, u, changes);
 }
 
-// 요청 변경 적용 + 기록 + 알림 + GitHub 반영 (사람·작업 연동 공통)
-async function applyRequestChanges(r, actor, changes) {
+// 요청 변경 적용 + 기록 + 알림 + GitHub 반영 (사람·버전 배포 공통)
+async function applyRequestChanges(r, actor, changes, { notifyText } = {}) {
   if (!changes.length) return;
   const at = now();
   for (const c of changes) {
     if (c.type === 'priority') r.priority = c.to;
     if (c.type === 'jobs') r.jobs = c.to;
     if (c.type === 'assignees') r.assignees = c.to;
-    if (c.type === 'version') r.targetVersion = c.to;
+    if (c.type === 'versions') r.versionIds = c.to;
     if (c.type === 'status') { r.status = c.to; r.statusReason = c.reason || ''; }
-    r.timeline.push({ ...c, at, by: who(actor) });
+    const entry = { ...c, at, by: who(actor) };
+    if (c.type === 'versions') { entry.from = c.from.map(labelOf); entry.to = c.to.map(labelOf); }
+    r.timeline.push(entry);
   }
   r.updatedAt = at;
   await save();
@@ -493,17 +548,22 @@ async function applyRequestChanges(r, actor, changes) {
   const lines = changes.map(describeChange);
   const added = (changes.find((c) => c.type === 'assignees') || { to: [] }).to;
   const notable = changes.some((c) => c.type === 'status' || c.type === 'priority');
-  notify(subjReq(r), actor, `${lines.join('\n')}\n(변경: ${actor.name})`, { channel: notable, dm: [r.requester.memberId, ...r.assignees, ...added] });
+  notify(subjReq(r), actor, notifyText || `${lines.join('\n')}\n(변경: ${actor.name})`, { channel: notable, dm: [r.requester.memberId, ...r.assignees, ...added] });
   ghQueue(() => ghSyncRequestUpdate(r, actor, changes, lines));
+}
+
+function labelOf(id) {
+  const v = db.versions.find((x) => x.id === id);
+  return v ? versionLabel(v) : String(id);
 }
 
 function describeChange(c) {
   switch (c.type) {
-    case 'status': return `상태: ${c.from} → ${c.to}${c.reason ? ` (사유: ${c.reason})` : ''}`;
-    case 'priority': return `우선순위: ${c.from || '미정'} → ${c.to || '미정'}`;
+    case 'status': return `상태: ${c.from} → ${c.to}${c.reason ? ` (${c.reason})` : ''}`;
+    case 'priority': return `우선순위: ${prioLabel(c.from)} → ${prioLabel(c.to)}`;
     case 'jobs': return `담당 직군: ${c.to.join(', ') || '미정'}`;
     case 'assignees': return `담당자: ${c.to.map(userName).join(', ') || '없음'}`;
-    case 'version': return `반영 버전: ${c.to || '없음'}`;
+    case 'versions': return `반영 버전: ${c.to.map(labelOf).join(', ') || '없음'}`;
     default: return '';
   }
 }
@@ -521,281 +581,139 @@ async function addRequestComment(u, r, b) {
   });
 }
 
-// ───────────────────────── 작업 (Jira형 관리) ─────────────────────────
-const TASK_FIELD_LABEL = {
-  title: '제목', description: '설명', status: '상태', assignee: '담당자', points: '스토리 포인트', labels: '라벨',
-  dueDate: '마감일', priority: '우선순위', job: '직군', epicId: '에픽', sprintId: '스프린트', repo: '저장소',
-};
+// ───────────────────────── 버전 관리 ─────────────────────────
+const VERSION_RE = /^[0-9A-Za-z][0-9A-Za-z.\-+_]{0,29}$/;
+const requestsIn = (v) => db.requests.filter((r) => r.versionIds.includes(v.id));
 
-function displayTaskField(field, v) {
-  if (field === 'sprintId' && v == null) return '백로그';
-  if (v === null || v === undefined || v === '' || (Array.isArray(v) && !v.length)) return '없음';
-  if (field === 'assignee') return userName(v);
-  if (field === 'epicId') { const e = db.epics.find((x) => x.id === v); return e ? `${e.key} ${e.title}` : '없음'; }
-  if (field === 'sprintId') { const s = db.sprints.find((x) => x.id === v); return s ? s.name : '백로그'; }
-  if (field === 'labels') return v.join(', ');
-  if (field === 'description') return '(내용 수정)';
-  return String(v);
+function versionFor(u, v, { timeline = false } = {}) {
+  const reqs = requestsIn(v).map((r) => {
+    const base = { id: r.id, title: r.title, status: r.status, priority: r.priority, requesterTeam: r.requesterTeam, type: r.type };
+    if (canView(u, r)) return { ...base, requester: r.requester.name };
+    return cfg.boardShowsAllTeams ? { ...base, restricted: true } : null;
+  }).filter(Boolean);
+  const { timeline: tl, ...rest } = v;
+  return { ...rest, requests: reqs, ...(timeline ? { timeline: tl } : {}) };
 }
 
-function nextRank(sprintId) {
-  const ranks = db.tasks.filter((t) => (t.sprintId ?? null) === sprintId).map((t) => t.rank || 0);
-  return (ranks.length ? Math.max(...ranks) : 0) + 1;
+function checkVersionName(platform, version, exceptId) {
+  if (!VERSION_RE.test(version)) throw httpError(400, '버전은 영문·숫자·점(.)·하이픈(-)으로 30자 안에서 적어 주세요. 예: 5.2.0');
+  if (db.versions.some((x) => x.id !== exceptId && x.platform === platform && x.version === version)) throw httpError(400, `${platform} ${version}은(는) 이미 있어요.`);
 }
 
-function parseTaskFields(b, creating) {
-  const f = {};
-  const has = (k) => b[k] !== undefined;
-  if (creating || has('title')) {
-    const t = str(b.title, 200);
-    if (!t) throw httpError(400, '작업 제목을 입력해 주세요.');
-    f.title = t;
-  }
-  if (has('description')) f.description = str(b.description, 10000);
-  if (has('status')) {
-    if (!ENUMS.taskStatuses.includes(b.status)) throw httpError(400, '작업 상태 값이 올바르지 않아요.');
-    f.status = b.status;
-  }
-  if (has('assignee')) {
-    const a = b.assignee || null;
-    if (a && !(db.users[a] && can(db.users[a], 'work.edit'))) throw httpError(400, '작업 권한이 없는 사람은 담당자로 지정할 수 없어요.');
-    f.assignee = a;
-  }
-  if (has('points')) {
-    const p = b.points === null || b.points === '' ? null : Number(b.points);
-    if (p !== null && !(Number.isFinite(p) && p >= 0 && p <= 100)) throw httpError(400, '스토리 포인트는 0~100 사이 숫자로 입력해 주세요.');
-    f.points = p;
-  }
-  if (has('labels')) f.labels = Array.isArray(b.labels) ? [...new Set(b.labels.map((x) => str(x, 30)).filter(Boolean))].slice(0, 10) : [];
-  if (has('dueDate')) f.dueDate = isDate(b.dueDate) ? b.dueDate : null;
-  if (has('priority')) {
-    const p = b.priority || null;
-    if (p && !ENUMS.priorities.includes(p)) throw httpError(400, '우선순위 값이 올바르지 않아요.');
-    f.priority = p;
-  }
-  if (has('job')) {
-    const j = b.job || '';
-    if (j && !ENUMS.jobs.includes(j)) throw httpError(400, '직군 값이 올바르지 않아요.');
-    f.job = j;
-  }
-  if (has('epicId')) {
-    const e = b.epicId === null || b.epicId === '' ? null : Number(b.epicId);
-    if (e !== null && !db.epics.some((x) => x.id === e)) throw httpError(400, '없는 에픽이에요.');
-    f.epicId = e;
-  }
-  if (has('sprintId')) {
-    const s = b.sprintId === null || b.sprintId === '' ? null : Number(b.sprintId);
-    if (s !== null) {
-      const sp = db.sprints.find((x) => x.id === s);
-      if (!sp || sp.state === 'closed') throw httpError(400, '끝난 스프린트에는 작업을 넣을 수 없어요.');
-    }
-    f.sprintId = s;
-  }
-  if (has('repo')) {
-    const r = str(b.repo, 100);
-    if (r && !reposList().includes(r)) throw httpError(400, '설정되지 않은 저장소예요.');
-    f.repo = r;
-  }
-  if (has('rank')) {
-    const r = Number(b.rank);
-    if (!Number.isFinite(r)) throw httpError(400, '순서 값이 올바르지 않아요.');
-    f.rank = r;
-  }
-  if (creating && b.requestId != null && b.requestId !== '') {
-    const id = Number(b.requestId);
-    if (!db.requests.some((x) => x.id === id)) throw httpError(400, '없는 요청이에요.');
-    f.requestId = id;
-  }
-  return f;
-}
-
-const taskListItem = (t) => {
-  const { timeline, ...rest } = t;
-  return { ...rest, commentCount: commentCount(timeline) };
-};
-
-async function createTask(u, b) {
-  const f = parseTaskFields(b, true);
-  const req = f.requestId ? db.requests.find((x) => x.id === f.requestId) : null;
-  const id = ++db.taskSeq;
+async function createVersion(u, b) {
+  const platform = ENUMS.versionPlatforms.includes(b.platform) ? b.platform : '';
+  if (!platform) throw httpError(400, '플랫폼을 골라 주세요.');
+  const version = str(b.version, 30).replace(/^v/i, '');
+  checkVersionName(platform, version);
   const at = now();
-  const sprintId = f.sprintId ?? null;
-  const t = {
-    id, key: `TASK-${id}`, title: f.title, description: f.description || '', status: f.status || '할 일',
-    assignee: f.assignee || null, points: f.points ?? null, labels: f.labels || [], dueDate: f.dueDate || null,
-    priority: f.priority !== undefined ? f.priority : req ? req.priority : null,
-    job: f.job || '', epicId: f.epicId ?? null, sprintId, requestId: req ? req.id : null,
-    repo: f.repo || (req ? repoFor(req) : cfg.github.defaultRepo || ''),
-    rank: f.rank ?? nextRank(sprintId), github: null, prs: [],
+  const v = {
+    id: ++db.versionSeq, platform, version, status: ENUMS.versionStatuses.includes(b.status) && b.status !== '배포 완료' ? b.status : '계획',
+    plannedDate: isDate(b.plannedDate) ? b.plannedDate : null, releasedDate: null, notes: str(b.notes, 5000),
     createdBy: who(u), createdAt: at, updatedAt: at, timeline: [{ type: 'created', at, by: who(u) }],
   };
-  db.tasks.push(t);
-  if (req) req.timeline.push({ type: 'task', at, by: who(u), text: `${t.key} ${t.title}` });
+  db.versions.push(v);
   await save();
-  if (t.assignee && t.assignee !== u.memberId) notify(subjTask(t), u, `작업이 배정됐어요 (배정: ${u.name})`, { channel: false, dm: [t.assignee] });
-  ghQueue(() => ghCreateTaskIssue(t));
-  if (t.status !== '할 일') await cascadeRequest(t, u);
-  return t;
+  return v;
 }
 
-async function updateTask(u, t, b) {
-  const f = parseTaskFields(b, false);
+const VERSION_FIELD_LABEL = { version: '버전', status: '상태', plannedDate: '배포 예정일', releasedDate: '배포일', notes: '릴리스 노트' };
+
+async function updateVersion(u, v, b) {
   const changes = [];
-  for (const [k, v] of Object.entries(f)) {
-    if (k === 'rank') continue;
-    if (k === 'repo' && t.github && t.github.number) continue; // 이슈가 만들어진 뒤에는 저장소 고정
-    if (JSON.stringify(t[k] ?? null) !== JSON.stringify(v ?? null)) changes.push({ field: k, from: t[k], to: v });
+  if (b.version !== undefined) {
+    const ver = str(b.version, 30).replace(/^v/i, '');
+    if (ver !== v.version) { checkVersionName(v.platform, ver, v.id); changes.push({ field: 'version', from: v.version, to: ver }); }
   }
-  if (f.rank !== undefined) t.rank = f.rank;
-  if (!changes.length) { if (f.rank !== undefined) await save(); return; }
-  await applyTaskChanges(t, u, changes);
-}
+  if (b.status !== undefined && b.status !== v.status) {
+    if (!ENUMS.versionStatuses.includes(b.status)) throw httpError(400, '버전 상태 값이 올바르지 않아요.');
+    changes.push({ field: 'status', from: v.status, to: b.status });
+  }
+  if (b.plannedDate !== undefined) {
+    const d = isDate(b.plannedDate) ? b.plannedDate : null;
+    if (d !== v.plannedDate) changes.push({ field: 'plannedDate', from: v.plannedDate, to: d });
+  }
+  if (b.releasedDate !== undefined) {
+    const d = isDate(b.releasedDate) ? b.releasedDate : null;
+    if (d !== v.releasedDate) changes.push({ field: 'releasedDate', from: v.releasedDate, to: d });
+  }
+  if (b.notes !== undefined) {
+    const n = str(b.notes, 5000);
+    if (n !== v.notes) changes.push({ field: 'notes', from: '', to: '' });
+    v._nextNotes = n;
+  }
+  const releasing = changes.some((c) => c.field === 'status' && c.to === '배포 완료');
+  if (releasing && !v.releasedDate && !changes.some((c) => c.field === 'releasedDate')) changes.push({ field: 'releasedDate', from: null, to: today() });
+  if (!changes.length) { delete v._nextNotes; return; }
 
-async function applyTaskChanges(t, actor, changes, { fromGitHub = false } = {}) {
   const at = now();
   for (const c of changes) {
-    t.timeline.push({ type: 'field', field: c.field, label: TASK_FIELD_LABEL[c.field], from: displayTaskField(c.field, c.from), to: displayTaskField(c.field, c.to), at, by: who(actor) });
-    t[c.field] = c.to;
+    if (c.field === 'notes') v.notes = v._nextNotes;
+    else v[c.field] = c.to;
+    v.timeline.push({ type: 'field', field: c.field, label: VERSION_FIELD_LABEL[c.field], from: c.field === 'notes' ? '' : c.from || '없음', to: c.field === 'notes' ? '수정' : c.to || '없음', at, by: who(u) });
   }
-  t.updatedAt = at;
+  delete v._nextNotes;
+  v.updatedAt = at;
   await save();
 
-  const fields = new Set(changes.map((c) => c.field));
-  if (fields.has('assignee') && t.assignee && t.assignee !== actor.memberId) {
-    notify(subjTask(t), actor, `작업이 배정됐어요 (배정: ${actor.name})`, { channel: false, dm: [t.assignee] });
+  const st = changes.find((c) => c.field === 'status');
+  if (st && !releasing) {
+    notify(subjVer(v), u, `버전 상태: ${st.from} → ${st.to} (변경: ${u.name})`, { channel: true });
+    await followVersion(v, u, st.to);
   }
-  if (!fromGitHub && t.github && t.github.number && (fields.has('title') || fields.has('status'))) {
-    ghQueue(async () => {
-      if (fields.has('title')) await ghPushTaskTitle(t);
-      if (fields.has('status')) await ghPushTaskStatus(t);
-    });
+  if (releasing) await releaseVersion(v, u);
+}
+
+// 버전이 QA·배포 대기로 가면 담긴 요청도 같은 칸으로 (보드 규칙: develop 머지 → QA, release 머지 → 배포 대기)
+const VERSION_ORDER = ['계획', '개발 중', 'QA', '배포 대기', '배포 완료'];
+const FOLLOW = { 'QA': { to: 'QA', from: ['개발 대기', '개발'] }, '배포 대기': { to: '배포 대기', from: ['개발 대기', '개발', 'QA'] } };
+async function followVersion(v, u, vStatus) {
+  const rule = FOLLOW[vStatus];
+  if (!rule) return;
+  for (const r of requestsIn(v)) {
+    if (!rule.from.includes(r.status)) continue;
+    // 여러 플랫폼에 걸친 요청은 모든 버전이 그 단계 이상일 때만 옮겨요
+    const ready = versionsOf(r).every((x) => VERSION_ORDER.indexOf(x.status) >= VERSION_ORDER.indexOf(vStatus));
+    if (!ready) continue;
+    await applyRequestChanges(r, u, [{ type: 'status', from: r.status, to: rule.to, reason: `${versionLabel(v)} ${vStatus}` }]);
   }
-  if (fields.has('status')) await cascadeRequest(t, actor);
 }
 
-// 작업 상태 → 연결된 요청 상태 자동 반영
-async function cascadeRequest(t, actor) {
-  if (!t.requestId) return;
-  const r = db.requests.find((x) => x.id === t.requestId);
-  if (!r || r.status === '반려' || r.status === '보류') return;
-  const list = tasksOf(r);
-  let to = null;
-  let reason = '';
-  if (list.length && list.every((x) => x.status === '완료')) {
-    if (r.status !== '완료') { to = '완료'; reason = '연결된 작업이 모두 끝났어요.'; }
-  } else if (list.some((x) => x.status !== '할 일')) {
-    if (r.status === '진행 예정' || r.status === '완료') to = '진행 중';
+// 배포 완료: 담긴 요청을 완료 처리하고 요청자에게 알림
+async function releaseVersion(v, u) {
+  const label = versionLabel(v);
+  const reqs = requestsIn(v);
+  notify(subjVer(v), u, `📦 ${label} 배포 완료 · 담긴 요청 ${reqs.length}건\n${reqs.map((r) => `- REQ-${r.id} ${r.title}`).join('\n')}`.trim(), { channel: true });
+  for (const r of reqs) {
+    const allShipped = versionsOf(r).every((x) => x.status === '배포 완료');
+    const text = `📦 요청하신 내용이 ${label}에 반영돼 배포됐어요.`;
+    if (allShipped && !DONE_STATUSES.has(r.status)) {
+      await applyRequestChanges(r, u, [{ type: 'status', from: r.status, to: '완료', reason: `${label} 배포` }], { notifyText: text });
+    } else {
+      r.timeline.push({ type: 'released', at: now(), by: who(u), text: label });
+      r.updatedAt = now();
+      await save();
+      notify(subjReq(r), u, allShipped ? text : `${text} (다른 플랫폼 배포는 아직 남아 있어요)`, { channel: false, dm: [r.requester.memberId] });
+    }
   }
-  if (to) await applyRequestChanges(r, actor, [{ type: 'status', from: r.status, to, reason }]);
 }
 
-async function addTaskComment(u, t, b) {
-  const text = str(b.text, 3000);
-  if (!text) throw httpError(400, '댓글 내용을 입력해 주세요.');
-  const at = now();
-  t.timeline.push({ type: 'comment', at, by: who(u), text });
-  t.updatedAt = at;
-  await save();
-  if (t.assignee && t.assignee !== u.memberId) notify(subjTask(t), u, `💬 ${u.name}: ${text.slice(0, 200)}`, { channel: false, dm: [t.assignee] });
-  ghQueue(async () => {
-    if (t.github && t.github.number) await ghComment(t.github, `💬 **${u.name}** (요청 창구 댓글)\n\n${text}`);
-  });
-}
-
-async function deleteTask(u, t) {
-  db.tasks = db.tasks.filter((x) => x.id !== t.id);
-  if (t.requestId) {
-    const r = db.requests.find((x) => x.id === t.requestId);
-    if (r) r.timeline.push({ type: 'taskDeleted', at: now(), by: who(u), text: `${t.key} ${t.title}` });
+async function setVersionRequest(u, v, b) {
+  const add = b.add !== undefined ? Number(b.add) : null;
+  const remove = b.remove !== undefined ? Number(b.remove) : null;
+  const r = db.requests.find((x) => x.id === (add ?? remove));
+  if (!r) throw httpError(404, '요청을 찾을 수 없어요.');
+  let ids;
+  if (add !== null) {
+    if (r.versionIds.includes(v.id)) return;
+    if (v.status === '취소') throw httpError(400, '취소된 버전에는 요청을 담을 수 없어요.');
+    if (!r.platforms.includes(v.platform)) throw httpError(400, `이 요청은 ${v.platform} 대상이 아니에요.`);
+    // 같은 플랫폼의 다른 버전에 담겨 있으면 이 버전으로 옮겨요
+    ids = [...r.versionIds.filter((id) => (db.versions.find((x) => x.id === id) || {}).platform !== v.platform), v.id];
+  } else {
+    if (!r.versionIds.includes(v.id)) return;
+    ids = r.versionIds.filter((id) => id !== v.id);
   }
-  await save();
-  ghQueue(async () => {
-    if (!t.github || !t.github.number) return;
-    await ghComment(t.github, `🗑️ **${u.name}** 님이 요청 창구에서 이 작업을 삭제했어요.`);
-    await gh('PATCH', `/repos/${t.github.repo}/issues/${t.github.number}`, { state: 'closed', state_reason: 'not_planned' });
-  });
-  const rest = db.tasks.find((x) => x.requestId === t.requestId);
-  if (rest) await cascadeRequest(rest, u);
-}
-
-// ───────────────────────── 스프린트·에픽 ─────────────────────────
-async function createSprint(u, b) {
-  const id = ++db.sprintSeq;
-  const s = {
-    id, name: str(b.name, 60) || `스프린트 ${id}`, goal: str(b.goal, 300),
-    startDate: isDate(b.startDate) ? b.startDate : null, endDate: isDate(b.endDate) ? b.endDate : null,
-    state: 'planned', createdAt: now(), createdBy: who(u), startedAt: null, closedAt: null, summary: null,
-  };
-  if (s.startDate && s.endDate && s.endDate < s.startDate) throw httpError(400, '끝나는 날이 시작일보다 빨라요.');
-  db.sprints.push(s);
-  await save();
-  return s;
-}
-
-async function updateSprint(u, s, b) {
-  if (s.state === 'closed') throw httpError(400, '끝난 스프린트는 바꿀 수 없어요.');
-  if (b.name !== undefined) s.name = str(b.name, 60) || s.name;
-  if (b.goal !== undefined) s.goal = str(b.goal, 300);
-  if (b.startDate !== undefined) s.startDate = isDate(b.startDate) ? b.startDate : null;
-  if (b.endDate !== undefined) s.endDate = isDate(b.endDate) ? b.endDate : null;
-  if (s.startDate && s.endDate && s.endDate < s.startDate) throw httpError(400, '끝나는 날이 시작일보다 빨라요.');
-  await save();
-}
-
-async function startSprint(u, s) {
-  if (s.state !== 'planned') throw httpError(400, '계획 중인 스프린트만 시작할 수 있어요.');
-  if (db.sprints.some((x) => x.state === 'active')) throw httpError(400, '이미 진행 중인 스프린트가 있어요. 먼저 완료해 주세요.');
-  s.state = 'active';
-  s.startDate = s.startDate || today();
-  s.endDate = s.endDate || today(14);
-  s.startedAt = now();
-  await save();
-}
-
-async function completeSprint(u, s, b) {
-  if (s.state !== 'active') throw httpError(400, '진행 중인 스프린트만 완료할 수 있어요.');
-  const moveTo = b.moveTo === undefined || b.moveTo === null || b.moveTo === '' ? null : Number(b.moveTo);
-  if (moveTo !== null && !db.sprints.some((x) => x.id === moveTo && x.state === 'planned')) throw httpError(400, '옮길 스프린트를 다시 골라 주세요.');
-  const tasks = db.tasks.filter((t) => t.sprintId === s.id);
-  const done = tasks.filter((t) => t.status === '완료');
-  s.summary = { total: tasks.length, done: done.length, points: sumPoints(tasks), donePoints: sumPoints(done) };
-  const at = now();
-  let rank = nextRank(moveTo);
-  for (const t of tasks) {
-    if (t.status === '완료') continue;
-    t.timeline.push({ type: 'field', field: 'sprintId', label: TASK_FIELD_LABEL.sprintId, from: s.name, to: displayTaskField('sprintId', moveTo), at, by: who(u) });
-    t.sprintId = moveTo;
-    t.rank = rank++;
-    t.updatedAt = at;
-  }
-  s.state = 'closed';
-  s.closedAt = at;
-  await save();
-}
-
-async function createEpic(u, b) {
-  const title = str(b.title, 120);
-  if (!title) throw httpError(400, '에픽 이름을 입력해 주세요.');
-  const id = ++db.epicSeq;
-  const e = {
-    id, key: `EP-${id}`, title, description: str(b.description, 2000),
-    color: ENUMS.epicColors.includes(b.color) ? b.color : ENUMS.epicColors[(id - 1) % ENUMS.epicColors.length],
-    status: 'open', createdAt: now(), createdBy: who(u),
-  };
-  db.epics.push(e);
-  await save();
-  return e;
-}
-
-async function updateEpic(u, e, b) {
-  if (b.title !== undefined) e.title = str(b.title, 120) || e.title;
-  if (b.description !== undefined) e.description = str(b.description, 2000);
-  if (b.color !== undefined && ENUMS.epicColors.includes(b.color)) e.color = b.color;
-  if (b.status !== undefined) {
-    if (!['open', 'done'].includes(b.status)) throw httpError(400, '에픽 상태 값이 올바르지 않아요.');
-    e.status = b.status;
-  }
-  await save();
+  await applyRequestChanges(r, u, [{ type: 'versions', from: r.versionIds, to: ids }]);
 }
 
 // ───────────────────────── 관리자 ─────────────────────────
@@ -803,8 +721,7 @@ function adminUsers() {
   return Object.values(db.users)
     .map((u) => ({
       memberId: u.memberId, name: u.name, team: u.team, job: u.job, groups: u.groups || [], ssoRoles: u.ssoRoles || [],
-      override: db.roleOverrides[u.memberId] || null, roles: rolesOf(u), configAdmin: cfg.admins.includes(u.memberId),
-      lastLoginAt: u.lastLoginAt,
+      override: db.roleOverrides[u.memberId] || null, roles: rolesOf(u), configAdmin: cfg.admins.includes(u.memberId), lastLoginAt: u.lastLoginAt,
     }))
     .sort((a, b) => a.name.localeCompare(b.name, 'ko'));
 }
@@ -821,10 +738,11 @@ async function setUserRole(u, target, b) {
 
 async function setRolePerms(b) {
   const input = b.rolePerms || {};
+  const current = rolePermsTable();
   const next = {};
   for (const r of ROLE_IDS) {
     if (r === 'admin') continue;
-    next[r] = pickList(input[r] !== undefined ? input[r] : rolePermsTable()[r], PERM_KEYS).filter((p) => p !== 'admin');
+    next[r] = pickList(input[r] !== undefined ? input[r] : current[r], PERM_KEYS).filter((p) => p !== 'admin');
   }
   db.rolePerms = next;
   await save();
@@ -832,7 +750,7 @@ async function setRolePerms(b) {
 
 // ───────────────────────── 알림 (슬랙) ─────────────────────────
 const subjReq = (r) => ({ ref: `REQ-${r.id}`, title: r.title, link: `#/r/${r.id}` });
-const subjTask = (t) => ({ ref: t.key, title: t.title, link: `#/t/${t.id}` });
+const subjVer = (v) => ({ ref: versionLabel(v), title: `${versionLabel(v)} 버전`, link: `#/v/${v.id}` });
 const slackEsc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 async function slackPost(url, payload, token) {
@@ -851,8 +769,7 @@ async function slackDm(user, text) {
   if (!user.email) throw new Error('이메일 없음');
   const t = cfg.slack.botToken;
   const lookup = await fetch(`https://slack.com/api/users.lookupByEmail?email=${encodeURIComponent(user.email)}`, {
-    headers: { Authorization: `Bearer ${t}` },
-    signal: AbortSignal.timeout(10000),
+    headers: { Authorization: `Bearer ${t}` }, signal: AbortSignal.timeout(10000),
   }).then((x) => x.json());
   if (!lookup.ok) throw new Error(lookup.error);
   await slackPost('https://slack.com/api/chat.postMessage', { channel: lookup.user.id, text }, t);
@@ -860,43 +777,37 @@ async function slackDm(user, text) {
 
 // 모든 알림은 '알림 기록'에 남고, 슬랙이 설정돼 있으면 실제로 전송
 async function notify(subj, actor, text, { channel = true, dm = [] } = {}) {
-  const targets = [...new Set(dm)].filter((id) => id && id !== actor.memberId).map((id) => db.users[id]).filter(Boolean);
-  if (!channel && !targets.length) return;
-  const message = `*[${subj.ref}] ${slackEsc(subj.title)}*\n${slackEsc(text)}\n<${cfg.baseUrl}/${subj.link}|요청 창구에서 보기>`;
-  const entry = { id: rand(6), at: now(), ref: subj.ref, link: subj.link, title: subj.title, text, channel, dm: targets.map((t) => t.name), delivery: [] };
-  db.notifications.unshift(entry);
-  if (db.notifications.length > 300) db.notifications.length = 300;
-
-  if (channel) {
-    if (!cfg.slack.webhookUrl) entry.delivery.push('채널: 웹훅 미설정 (기록만)');
-    else {
-      try { await slackPost(cfg.slack.webhookUrl, { text: message }); entry.delivery.push('채널: 전송됨'); }
-      catch (e) { entry.delivery.push(`채널: 실패 (${e.message})`); }
+  try {
+    const targets = [...new Set(dm)].filter((id) => id && id !== actor.memberId).map((id) => db.users[id]).filter(Boolean);
+    if (!channel && !targets.length) return;
+    const message = `*[${subj.ref}] ${slackEsc(subj.title)}*\n${slackEsc(text)}\n<${cfg.baseUrl}/${subj.link}|요청 창구에서 보기>`;
+    const entry = { id: rand(6), at: now(), ref: subj.ref, link: subj.link, title: subj.title, text, channel, dm: targets.map((t) => t.name), delivery: [] };
+    db.notifications.unshift(entry);
+    if (db.notifications.length > 300) db.notifications.length = 300;
+    if (channel) {
+      if (!cfg.slack.webhookUrl) entry.delivery.push('채널: 웹훅 미설정 (기록만)');
+      else {
+        try { await slackPost(cfg.slack.webhookUrl, { text: message }); entry.delivery.push('채널: 전송됨'); }
+        catch (e) { entry.delivery.push(`채널: 실패 (${e.message})`); }
+      }
     }
+    for (const t of targets) {
+      if (!cfg.slack.botToken) { entry.delivery.push(`DM ${t.name}: 봇 토큰 미설정 (기록만)`); continue; }
+      try { await slackDm(t, message); entry.delivery.push(`DM ${t.name}: 전송됨`); }
+      catch (e) { entry.delivery.push(`DM ${t.name}: 실패 (${e.message})`); }
+    }
+    save();
+  } catch (e) {
+    console.error('[알림]', e);
   }
-  for (const t of targets) {
-    if (!cfg.slack.botToken) { entry.delivery.push(`DM ${t.name}: 봇 토큰 미설정 (기록만)`); continue; }
-    try { await slackDm(t, message); entry.delivery.push(`DM ${t.name}: 전송됨`); }
-    catch (e) { entry.delivery.push(`DM ${t.name}: 실패 (${e.message})`); }
-  }
-  save();
 }
 
-// ───────────────────────── GitHub 연동 (양방향) ─────────────────────────
-// 나가는 방향: 이슈 생성·제목·상태(라벨+열림/닫힘)·댓글
-// 들어오는 방향: 주기적 조회(polling)로 이슈 상태·제목·댓글, PR 연결·머지를 반영 → 사내 서버를 외부에 열 필요 없음
+// ───────────────────────── GitHub (요청 → 이슈) ─────────────────────────
 const GH_MARKER = '<!-- request-hub -->';
-const GH_ACTOR = { memberId: 'github', name: 'GitHub' };
-const STATUS_LABEL = { '진행 중': '상태:진행 중', '리뷰': '상태:리뷰' };
-const pollState = { lastAt: null, lastError: null };
-
-function reposList() {
-  return [...new Set([cfg.github.defaultRepo, ...Object.values(cfg.github.repoByPlatform), ...cfg.github.repos].filter(Boolean))];
-}
-const githubEnabled = () => !!(cfg.github.token && reposList().length);
+const githubRepos = () => [...new Set([cfg.github.defaultRepo, ...Object.values(cfg.github.repoByPlatform)].filter(Boolean))];
+const githubEnabled = () => !!(cfg.github.token && githubRepos().length);
 
 let ghChain = Promise.resolve();
-// 모든 GitHub 호출은 한 줄로 실행해서 보내기와 받아오기가 서로 엇갈리지 않게 해요
 function ghQueue(fn) {
   if (!githubEnabled()) return Promise.resolve();
   const next = ghChain.then(fn).catch((e) => console.error('[GitHub]', e.message));
@@ -908,11 +819,8 @@ async function gh(method, url, body) {
   const r = await fetch(cfg.github.apiUrl + url, {
     method,
     headers: {
-      Authorization: `Bearer ${cfg.github.token}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'internal-request-hub',
-      'Content-Type': 'application/json',
+      Authorization: `Bearer ${cfg.github.token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'internal-request-hub', 'Content-Type': 'application/json',
     },
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(15000),
@@ -928,24 +836,21 @@ async function gh(method, url, body) {
   return data;
 }
 
-async function ghCreateIssue(repo, payload) {
-  try { return await gh('POST', `/repos/${repo}/issues`, payload); }
-  catch (e) {
-    if (e.status !== 422 || !payload.labels) throw e;
-    const { labels, ...rest } = payload; // 라벨 권한이 없으면 라벨 없이 다시 시도
-    return gh('POST', `/repos/${repo}/issues`, rest);
-  }
-}
-
 const ghComment = (g, body) => gh('POST', `/repos/${g.repo}/issues/${g.number}/comments`, { body: `${body}\n\n${GH_MARKER}` });
 
 function repoFor(r) {
   const byP = cfg.github.repoByPlatform;
   if (r.platforms.length === 1 && byP[r.platforms[0]]) return byP[r.platforms[0]];
-  return cfg.github.defaultRepo || reposList()[0] || '';
+  return cfg.github.defaultRepo || githubRepos()[0] || '';
 }
 
 const cell = (s) => String(s || '-').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+
+// task-management 라벨 체계: project: + type: (+ 우선순위가 정해지면 priority:)
+function ghLabels(r) {
+  const projects = r.platforms.map((p) => cfg.github.projectLabels[p] || DEFAULT_PROJECT_LABELS[p]).filter(Boolean);
+  return [...new Set(projects), ...(GH_TYPE[r.type] ? [`type: ${GH_TYPE[r.type]}`] : []), ...(r.priority ? [`priority: ${GH_PRIORITY[r.priority]}`] : [])];
+}
 
 function requestIssueBody(r) {
   return [
@@ -956,6 +861,7 @@ function requestIssueBody(r) {
     `| 요청자 | ${cell(`${r.requester.name} (${r.requesterTeam})`)} |`,
     `| 플랫폼 | ${cell(r.platforms.join(', '))} |`,
     `| 유형 | ${cell(r.type)} |`,
+    `| 우선순위 | ${cell(prioLabel(r.priority))} |`,
     `| 담당 직군 | ${cell(r.jobs.join(', ') || '미정')} |`,
     `| 희망 완료일 | ${cell(r.dueDate)} |`,
     `| 긴급도 | **${r.urgency}** — ${cell(r.urgencyReason)} |`,
@@ -972,12 +878,16 @@ async function ghCreateRequestIssue(r) {
   if (r.github && r.github.number) return;
   const repo = repoFor(r);
   if (!repo) { r.github = { error: '대상 저장소가 설정되지 않았어요.' }; return save(); }
+  const payload = { title: `[REQ-${r.id}] ${r.title}`, body: requestIssueBody(r), labels: ghLabels(r) };
   try {
-    const issue = await ghCreateIssue(repo, {
-      title: `[REQ-${r.id}] ${r.title}`, body: requestIssueBody(r),
-      labels: ['요청창구', ...r.platforms.map((p) => `플랫폼:${p}`), `유형:${r.type}`],
-    });
-    r.github = { repo, number: issue.number, id: issue.id, url: issue.html_url };
+    let issue;
+    try { issue = await gh('POST', `/repos/${repo}/issues`, payload); }
+    catch (e) {
+      if (e.status !== 422) throw e;
+      const { labels, ...rest } = payload; // 라벨 권한이 없으면 라벨 없이 다시 시도
+      issue = await gh('POST', `/repos/${repo}/issues`, rest);
+    }
+    r.github = { repo, number: issue.number, url: issue.html_url };
   } catch (e) {
     r.github = { repo, error: e.message };
   }
@@ -990,8 +900,8 @@ async function ghSyncRequestUpdate(r, actor, changes, lines) {
   await ghComment(r.github, `🔄 **${actor.name}** 님이 요청 창구에서 변경했어요\n\n${lines.map((l) => `- ${l}`).join('\n')}`);
   const p = changes.find((c) => c.type === 'priority');
   if (p) {
-    if (p.from) await gh('DELETE', `${base}/labels/${encodeURIComponent('우선순위:' + p.from)}`).catch(() => {});
-    if (p.to) await gh('POST', `${base}/labels`, { labels: [`우선순위:${p.to}`] }).catch((e) => console.error('[GitHub] 라벨:', e.message));
+    if (p.from) await gh('DELETE', `${base}/labels/${encodeURIComponent('priority: ' + GH_PRIORITY[p.from])}`).catch(() => {});
+    if (p.to) await gh('POST', `${base}/labels`, { labels: [`priority: ${GH_PRIORITY[p.to]}`] }).catch((e) => console.error('[GitHub] 라벨:', e.message));
   }
   const s = changes.find((c) => c.type === 'status');
   if (s) {
@@ -1000,169 +910,6 @@ async function ghSyncRequestUpdate(r, actor, changes, lines) {
     else if (s.from === '완료' || s.from === '반려') await gh('PATCH', base, { state: 'open' });
   }
 }
-
-function deriveStatus(issue) {
-  if (issue.state === 'closed') return '완료';
-  const names = (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name));
-  if (names.includes(STATUS_LABEL['리뷰'])) return '리뷰';
-  if (names.includes(STATUS_LABEL['진행 중'])) return '진행 중';
-  return '할 일';
-}
-
-async function ghCreateTaskIssue(t) {
-  if (t.github && t.github.number) return;
-  if (!db.tasks.includes(t)) return; // 그사이 삭제됨
-  const repo = t.repo || cfg.github.defaultRepo;
-  if (!repo) { t.github = { error: '저장소가 설정되지 않았어요.' }; return save(); }
-  const req = t.requestId ? db.requests.find((r) => r.id === t.requestId) : null;
-  const body = [
-    `> 사내 요청 창구 작업 **${t.key}** · ${cfg.baseUrl}/#/t/${t.id}`,
-    ...(req ? [`> 연결된 요청: REQ-${req.id} ${req.title}${req.github && req.github.number ? ` (${req.github.repo}#${req.github.number})` : ''}`] : []),
-    '',
-    t.description || '_설명 없음_',
-    '',
-    '---',
-    `PR 제목이나 본문에 \`${t.key}\` 또는 \`Closes #이슈번호\`를 적으면 이 작업에 연결돼요. PR이 열리면 '리뷰', 머지되면 '완료'로 바뀌어요.`,
-  ].join('\n');
-  try {
-    const issue = await ghCreateIssue(repo, {
-      title: `[${t.key}] ${t.title}`, body,
-      labels: ['작업', ...(t.job ? [`직군:${t.job}`] : []), ...(STATUS_LABEL[t.status] ? [STATUS_LABEL[t.status]] : [])],
-    });
-    t.github = { repo, number: issue.number, id: issue.id, url: issue.html_url, syncedStatus: deriveStatus(issue), syncedTitle: t.title };
-    await save();
-    if (t.status !== t.github.syncedStatus) await ghPushTaskStatus(t);
-    if (req && req.github && req.github.number) {
-      await gh('POST', `/repos/${req.github.repo}/issues/${req.github.number}/sub_issues`, { sub_issue_id: issue.id })
-        .catch((e) => console.warn('[GitHub] 하위 이슈 연결 실패:', e.message));
-    }
-  } catch (e) {
-    t.github = { repo, error: e.message };
-  }
-  await save();
-}
-
-async function ghPushTaskTitle(t) {
-  if (!t.github || !t.github.number) return;
-  await gh('PATCH', `/repos/${t.github.repo}/issues/${t.github.number}`, { title: `[${t.key}] ${t.title}` });
-  t.github.syncedTitle = t.title;
-  await save();
-}
-
-async function ghPushTaskStatus(t) {
-  if (!t.github || !t.github.number) return;
-  const want = t.status;
-  const base = `/repos/${t.github.repo}/issues/${t.github.number}`;
-  for (const l of Object.values(STATUS_LABEL)) {
-    if (l !== STATUS_LABEL[want]) await gh('DELETE', `${base}/labels/${encodeURIComponent(l)}`).catch(() => {});
-  }
-  if (STATUS_LABEL[want]) await gh('POST', `${base}/labels`, { labels: [STATUS_LABEL[want]] });
-  await gh('PATCH', base, want === '완료' ? { state: 'closed', state_reason: 'completed' } : { state: 'open' });
-  t.github.syncedStatus = want;
-  await save();
-}
-
-const findByIssue = (list, repo, number) => list.find((x) => x.github && x.github.repo === repo && x.github.number === number);
-
-async function inboundIssue(repo, it) {
-  const t = findByIssue(db.tasks, repo, it.number);
-  if (!t) return;
-  const changes = [];
-  const derived = deriveStatus(it);
-  // GitHub 쪽이 마지막으로 맞춰 둔 상태와 다를 때만 GitHub에서 바뀐 것으로 봐요
-  if (derived !== t.github.syncedStatus) {
-    t.github.syncedStatus = derived;
-    if (t.status !== derived) changes.push({ field: 'status', from: t.status, to: derived });
-  }
-  const title = String(it.title || '').replace(/^\[TASK-\d+\]\s*/, '').trim();
-  if (title && title !== t.github.syncedTitle) {
-    t.github.syncedTitle = title;
-    if (t.title !== title) changes.push({ field: 'title', from: t.title, to: title });
-  }
-  if (changes.length) await applyTaskChanges(t, GH_ACTOR, changes, { fromGitHub: true });
-}
-
-async function inboundPull(repo, it) {
-  const text = `${it.title || ''}\n${it.body || ''}`;
-  const ids = new Set();
-  for (const m of text.matchAll(/\bTASK-(\d+)\b/gi)) ids.add(Number(m[1]));
-  for (const m of text.matchAll(/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi)) {
-    const t = findByIssue(db.tasks, repo, Number(m[1]));
-    if (t) ids.add(t.id);
-  }
-  const merged = !!(it.pull_request && it.pull_request.merged_at);
-  const pr = { repo, number: it.number, url: it.html_url, title: it.title, state: merged ? 'merged' : it.state, draft: !!it.draft, author: it.user ? it.user.login : '' };
-  for (const id of ids) {
-    const t = db.tasks.find((x) => x.id === id);
-    if (!t) continue;
-    t.prs = t.prs || [];
-    const prev = t.prs.find((p) => p.repo === repo && p.number === it.number);
-    if (prev && prev.state === pr.state && prev.title === pr.title && prev.draft === pr.draft) continue;
-    const before = prev ? { state: prev.state, draft: prev.draft } : null; // 갱신 전 상태로 비교
-    const at = now();
-    if (!prev) { t.prs.push({ ...pr }); t.timeline.push({ type: 'pr', at, by: GH_ACTOR, text: `PR #${pr.number} 연결: ${pr.title}`, url: pr.url }); }
-    else Object.assign(prev, pr);
-    const newlyMerged = merged && (!before || before.state !== 'merged');
-    const newlyReady = pr.state === 'open' && !pr.draft && (!before || before.state !== 'open' || before.draft);
-    if (newlyMerged) t.timeline.push({ type: 'pr', at, by: GH_ACTOR, text: `PR #${pr.number} 머지됨`, url: pr.url });
-    t.updatedAt = at;
-    let to = null;
-    if (newlyMerged && t.status !== '완료') to = '완료';
-    else if (newlyReady && (t.status === '할 일' || t.status === '진행 중')) to = '리뷰';
-    if (to) await applyTaskChanges(t, GH_ACTOR, [{ field: 'status', from: t.status, to }]);
-    else await save();
-  }
-}
-
-async function inboundComment(repo, c) {
-  if (String(c.body || '').includes(GH_MARKER)) return; // 우리가 보낸 댓글
-  const number = Number(String(c.issue_url || '').split('/').pop());
-  const target = findByIssue(db.tasks, repo, number) || findByIssue(db.requests, repo, number);
-  if (!target || target.timeline.some((x) => x.ghCommentId === c.id)) return;
-  const login = c.user ? c.user.login : 'GitHub';
-  target.timeline.push({ type: 'comment', at: c.created_at || now(), by: { memberId: null, name: `${login} (GitHub)` }, text: String(c.body || ''), ghCommentId: c.id, url: c.html_url });
-  target.updatedAt = now();
-  await save();
-  if (target.requester) {
-    notify(subjReq(target), GH_ACTOR, `💬 ${login} (GitHub): ${String(c.body || '').slice(0, 200)}`, { channel: false, dm: [target.requester.memberId, ...target.assignees] });
-  } else if (target.assignee) {
-    notify(subjTask(target), GH_ACTOR, `💬 ${login} (GitHub): ${String(c.body || '').slice(0, 200)}`, { channel: false, dm: [target.assignee] });
-  }
-}
-
-async function ghPollRepo(repo) {
-  const st = db.ghSync[repo] || (db.ghSync[repo] = {});
-  const startedAt = Date.now();
-  const since = encodeURIComponent(st.since || new Date(startedAt - 24 * 3600e3).toISOString());
-  const items = [];
-  for (let page = 1; page <= 5; page++) {
-    const list = await gh('GET', `/repos/${repo}/issues?state=all&since=${since}&sort=updated&direction=asc&per_page=100&page=${page}`);
-    items.push(...list);
-    if (list.length < 100) break;
-  }
-  for (const it of items) {
-    if (it.pull_request) await inboundPull(repo, it);
-    else await inboundIssue(repo, it);
-  }
-  const comments = await gh('GET', `/repos/${repo}/issues/comments?since=${since}&sort=updated&direction=asc&per_page=100`);
-  for (const c of comments) await inboundComment(repo, c);
-  st.since = new Date(startedAt - 10000).toISOString(); // 시계 차이 대비 10초 겹쳐서 조회
-  await save();
-}
-
-async function ghPollAll() {
-  const repos = new Set(reposList());
-  for (const x of [...db.tasks, ...db.requests]) if (x.github && x.github.repo) repos.add(x.github.repo);
-  try {
-    for (const repo of repos) await ghPollRepo(repo);
-    pollState.lastAt = now();
-    pollState.lastError = null;
-  } catch (e) {
-    pollState.lastError = e.message;
-    throw e;
-  }
-}
-const schedulePoll = () => ghQueue(ghPollAll);
 
 // ───────────────────────── 라우팅 ─────────────────────────
 function meta() {
@@ -1175,24 +922,12 @@ function meta() {
           const g = resolveGroups(m.permGroupIds);
           const roles = cfg.admins.includes(m.memberId) ? ['admin'] : db.roleOverrides[m.memberId] ? [db.roleOverrides[m.memberId]] : g ? g.ssoRoles : [];
           const names = roles.map((r) => (ROLES.find((x) => x.id === r) || {}).name).join(', ');
-          return { memberId: m.memberId, memberName: m.memberName, label: g || roles.length ? `${g ? g.team : ''} · ${names}` : '권한그룹 없음 (접속 불가 확인용)' };
+          return { memberId: m.memberId, memberName: m.memberName, label: roles.length ? `${g ? g.team : ''} · ${names}` : '권한그룹 없음 (접속 불가 확인용)' };
         })
       : [],
-    enums: ENUMS,
-    roles: ROLES,
-    perms: PERMS,
+    enums: ENUMS, roles: ROLES, perms: PERMS,
     integrations: { github: githubEnabled(), slackChannel: !!cfg.slack.webhookUrl, slackDm: !!cfg.slack.botToken },
     boardShowsAllTeams: cfg.boardShowsAllTeams,
-  };
-}
-
-function workPayload() {
-  return {
-    tasks: db.tasks.map(taskListItem),
-    epics: db.epics,
-    sprints: db.sprints,
-    repos: reposList(),
-    github: { enabled: githubEnabled(), pollSeconds: cfg.github.pollSeconds, lastPollAt: pollState.lastAt, lastPollError: pollState.lastError },
   };
 }
 
@@ -1208,9 +943,8 @@ async function handleApi(req, res, p) {
   if (!u) return send(res, 401, { message: '로그인이 필요해요.' });
   const body = m === 'GET' ? {} : await readJson(req);
 
-  // ── 공통
   if (p === '/api/me' && m === 'GET') return send(res, 200, publicUser(u));
-  if (p === '/api/users' && m === 'GET') return send(res, 200, Object.values(db.users).filter((x) => can(x, 'work.edit')).map(publicUser));
+  if (p === '/api/users' && m === 'GET') return send(res, 200, Object.values(db.users).filter((x) => can(x, 'request.handle')).map(publicUser));
 
   // ── 요청
   if (p === '/api/requests' && m === 'GET') return send(res, 200, listFor(u));
@@ -1232,45 +966,16 @@ async function handleApi(req, res, p) {
     }
   }
 
-  // ── 작업 관리
-  if (p === '/api/work' && m === 'GET') { need(u, 'work.view'); return send(res, 200, workPayload()); }
-  if (p === '/api/tasks' && m === 'POST') { need(u, 'work.edit'); return send(res, 201, await createTask(u, body)); }
-  mm = p.match(/^\/api\/tasks\/(\d+)(\/comments|\/github-sync)?$/);
+  // ── 버전
+  if (p === '/api/versions' && m === 'GET') return send(res, 200, db.versions.map((v) => versionFor(u, v)));
+  if (p === '/api/versions' && m === 'POST') { need(u, 'version.manage'); return send(res, 201, versionFor(u, await createVersion(u, body), { timeline: true })); }
+  mm = p.match(/^\/api\/versions\/(\d+)(\/requests)?$/);
   if (mm) {
-    need(u, 'work.view');
-    const t = db.tasks.find((x) => x.id === Number(mm[1]));
-    if (!t) return send(res, 404, { message: '작업을 찾을 수 없어요. 삭제됐을 수 있어요.' });
-    const sub = mm[2];
-    if (!sub && m === 'GET') return send(res, 200, t);
-    if (!sub && m === 'PATCH') { need(u, 'work.edit'); await updateTask(u, t, body); return send(res, 200, t); }
-    if (!sub && m === 'DELETE') { need(u, 'work.plan'); await deleteTask(u, t); return send(res, 200, { ok: true }); }
-    if (sub === '/comments' && m === 'POST') { await addTaskComment(u, t, body); return send(res, 201, t); }
-    if (sub === '/github-sync' && m === 'POST') {
-      need(u, 'work.edit');
-      if (!githubEnabled()) throw httpError(400, 'GitHub 연동이 설정되지 않았어요.');
-      if (t.github && t.github.error) t.github = null;
-      await ghQueue(() => ghCreateTaskIssue(t));
-      return send(res, 200, t);
-    }
-  }
-  if (p === '/api/sprints' && m === 'POST') { need(u, 'work.plan'); return send(res, 201, await createSprint(u, body)); }
-  mm = p.match(/^\/api\/sprints\/(\d+)(\/start|\/complete)?$/);
-  if (mm) {
-    need(u, 'work.plan');
-    const s = db.sprints.find((x) => x.id === Number(mm[1]));
-    if (!s) return send(res, 404, { message: '스프린트를 찾을 수 없어요.' });
-    if (!mm[2] && m === 'PATCH') { await updateSprint(u, s, body); return send(res, 200, s); }
-    if (mm[2] === '/start' && m === 'POST') { await startSprint(u, s); return send(res, 200, s); }
-    if (mm[2] === '/complete' && m === 'POST') { await completeSprint(u, s, body); return send(res, 200, s); }
-  }
-  if (p === '/api/epics' && m === 'POST') { need(u, 'work.plan'); return send(res, 201, await createEpic(u, body)); }
-  mm = p.match(/^\/api\/epics\/(\d+)$/);
-  if (mm && m === 'PATCH') {
-    need(u, 'work.plan');
-    const e = db.epics.find((x) => x.id === Number(mm[1]));
-    if (!e) return send(res, 404, { message: '에픽을 찾을 수 없어요.' });
-    await updateEpic(u, e, body);
-    return send(res, 200, e);
+    const v = db.versions.find((x) => x.id === Number(mm[1]));
+    if (!v) return send(res, 404, { message: '버전을 찾을 수 없어요.' });
+    if (!mm[2] && m === 'GET') return send(res, 200, versionFor(u, v, { timeline: true }));
+    if (!mm[2] && m === 'PATCH') { need(u, 'version.manage'); await updateVersion(u, v, body); return send(res, 200, versionFor(u, v, { timeline: true })); }
+    if (mm[2] && m === 'POST') { need(u, 'version.manage'); await setVersionRequest(u, v, body); return send(res, 200, versionFor(u, v, { timeline: true })); }
   }
 
   // ── 관리자
@@ -1286,12 +991,6 @@ async function handleApi(req, res, p) {
   }
   if (p === '/api/admin/roles' && m === 'GET') { need(u, 'admin'); return send(res, 200, rolePermsTable()); }
   if (p === '/api/admin/roles' && m === 'PUT') { need(u, 'admin'); await setRolePerms(body); return send(res, 200, rolePermsTable()); }
-  if (p === '/api/admin/github/poll' && m === 'POST') {
-    need(u, 'admin');
-    if (!githubEnabled()) throw httpError(400, 'GitHub 연동이 설정되지 않았어요.');
-    await schedulePoll();
-    return send(res, 200, { lastPollAt: pollState.lastAt, lastPollError: pollState.lastError });
-  }
 
   return send(res, 404, { message: '없는 주소예요.' });
 }
@@ -1351,6 +1050,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// 예상 못 한 오류로 서버 전체가 꺼지지 않도록 기록만 남겨요
+process.on('unhandledRejection', (e) => console.error('[처리되지 않은 오류]', e));
+
 // ───────────────────────── 시작 ─────────────────────────
 if (cfg.sso.mode === 'mock') {
   // 테스트 계정은 설정이 바뀌어도 바로 반영되도록 매번 다시 맞춰요 (로그인 기록은 유지)
@@ -1359,12 +1061,14 @@ if (cfg.sso.mode === 'mock') {
   save();
 }
 
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') console.error(`\n❌ ${cfg.port}번 포트를 이미 다른 프로그램(아마 다른 요청 창구 서버)이 쓰고 있어요. 그 창을 닫거나 PORT를 바꿔서 실행해 주세요.\n`);
+  else console.error(e);
+  process.exit(1);
+});
+
 server.listen(cfg.port, cfg.host, () => {
   console.log(`요청 창구 실행 중: ${cfg.baseUrl}  (포트 ${cfg.port})`);
   if (cfg.sso.mode === 'mock') console.warn('⚠️  테스트 로그인(mock) 모드예요. 사내 배포 전 config.json의 sso.mode를 "real"로 바꿔 주세요.');
-  console.log(`GitHub 연동: ${githubEnabled() ? `켜짐 (${cfg.github.pollSeconds}초마다 동기화)` : '꺼짐'} / 슬랙 채널: ${cfg.slack.webhookUrl ? '켜짐' : '꺼짐'} / 슬랙 DM: ${cfg.slack.botToken ? '켜짐' : '꺼짐'}`);
-  if (githubEnabled()) {
-    setTimeout(schedulePoll, 3000);
-    setInterval(schedulePoll, cfg.github.pollSeconds * 1000);
-  }
+  console.log(`GitHub 연동: ${githubEnabled() ? '켜짐' : '꺼짐'} / 슬랙 채널: ${cfg.slack.webhookUrl ? '켜짐' : '꺼짐'} / 슬랙 DM: ${cfg.slack.botToken ? '켜짐' : '꺼짐'}`);
 });

@@ -80,27 +80,13 @@ function renderAdminRoles(el, table) {
 }
 
 function renderAdminIntegrations(el) {
-  const I = S.meta.integrations, g = S.work.github || {};
+  const I = S.meta.integrations;
   const on = (x) => (x ? '<span class="on">연결됨</span>' : '<span class="off">미설정</span>');
   el.innerHTML = `<div class="integr">
     <div class="panel"><h3>GitHub ${on(I.github)}</h3>
-      <dl><dt>저장소</dt><dd class="mono" style="font-size:12px">${(S.work.repos || []).map(esc).join('<br>') || '-'}</dd>
-        <dt>동기화 주기</dt><dd>${g.pollSeconds ? `${g.pollSeconds}초마다` : '-'}</dd>
-        <dt>마지막 동기화</dt><dd>${g.lastPollAt ? fmtDateTime(g.lastPollAt) : '아직 없음'}</dd>
-        ${g.lastPollError ? `<dt>오류</dt><dd style="color:var(--danger)">${esc(g.lastPollError)}</dd>` : ''}</dl>
-      <p class="hint">작업 상태·제목·댓글과 PR 연결을 주기적으로 받아와요. 사내 서버를 외부에 열 필요가 없어요.</p>
-      ${I.github ? '<div><button class="btn sm" id="gh-poll">지금 동기화</button></div>' : '<p class="hint">설정 방법은 README의 \'GitHub 연동\'을 참고해 주세요.</p>'}</div>
-    <div class="panel"><h3>슬랙 채널 ${on(I.slackChannel)}</h3><p class="hint">새 요청, 상태·우선순위 변경을 채널에 올려요.</p></div>
-    <div class="panel"><h3>슬랙 DM ${on(I.slackDm)}</h3><p class="hint">요청자·담당자에게 개인 메시지로 알려요. 통합계정 이메일로 슬랙 사용자를 찾아요.</p></div>
+      <p class="hint">요청이 접수되면 이슈를 만들고, 우선순위·상태가 바뀌면 댓글과 라벨로 남겨요. 완료·반려되면 이슈를 닫아요.</p>
+      ${I.github ? '' : '<p class="hint">설정 방법은 README의 \'GitHub 연동\'을 참고해 주세요.</p>'}</div>
+    <div class="panel"><h3>슬랙 채널 ${on(I.slackChannel)}</h3><p class="hint">새 요청, 상태·우선순위 변경, 버전 배포를 채널에 올려요.</p></div>
+    <div class="panel"><h3>슬랙 DM ${on(I.slackDm)}</h3><p class="hint">요청자·담당자에게 개인 메시지로 알려요. 요청이 담긴 버전이 배포되면 요청자에게도 알려요.</p></div>
   </div>`;
-  const b = $('#gh-poll');
-  if (b) b.onclick = async () => {
-    b.disabled = true;
-    try {
-      const r = await api('POST', '/api/admin/github/poll', {});
-      toast(r.lastPollError ? `동기화하지 못했어요: ${r.lastPollError}` : 'GitHub과 동기화했어요.', !!r.lastPollError);
-      await refresh();
-      renderAdminIntegrations(el);
-    } catch (e) { toast(e.message, true); b.disabled = false; }
-  };
 }

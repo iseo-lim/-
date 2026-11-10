@@ -26,9 +26,7 @@
     "token": "",
     "apiUrl": "https://api.github.com",
     "defaultRepo": "",
-    "repoByPlatform": {},
-    "repos": [],
-    "pollSeconds": 60
+    "repoByPlatform": {}
   },
 
   "slack": {

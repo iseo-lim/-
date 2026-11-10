@@ -1,29 +1,27 @@
 'use strict';
-/* 공통: 상태 · 도우미 · 로그인 · 앱 골격 · 라우팅 · 모달 · 진행 막대 */
+/* 공통: 상태 · 도우미 · 로그인 · 앱 골격 · 라우팅 · 모달 */
 
 const S = {
-  meta: null, me: null, requests: [], users: [], usersById: {},
-  work: { tasks: [], epics: [], sprints: [], repos: [], github: {} },
-  lastView: 'board', detail: null, // { kind: 'r'|'t', id }
+  meta: null, me: null, requests: [], users: [], usersById: {}, versions: [],
+  lastView: 'board', detail: null, // { kind: 'r'|'v', id }
   board: { platform: '', job: '', mine: false, showClosed: false },
   list: { q: '', status: 'open', priority: '', platform: '', job: '', team: '', mine: false, requested: false },
   triageTab: '접수',
-  sprintF: { assignee: '', epic: '', job: '', mine: false },
-  backlogF: { q: '', epic: '', assignee: '' },
   draft: { attachments: [] },
-  dragging: false,
 };
 let started = false;
 
+// 요청 상태 = task-management 보드 칸 (규칙 v2) + 접수·보류·반려
 const STATUS_CLASS = {
-  '접수': 'st-접수', '진행 예정': 'st-진행예정', '진행 중': 'st-진행중', '완료': 'st-완료', '보류': 'st-보류', '반려': 'st-반려',
-  '할 일': 'st-할일', '리뷰': 'st-리뷰',
+  '접수': 'st-접수', '백로그': 'st-백로그', '기획·디자인': 'st-진행예정', '개발 대기': 'st-개발대기', '개발': 'st-진행중',
+  'QA': 'st-리뷰', '배포 대기': 'st-배포대기', '완료': 'st-완료', '보류': 'st-보류', '반려': 'st-반려',
+  '계획': 'st-접수', '개발 중': 'st-진행중', '배포 완료': 'st-완료', '취소': 'st-취소',
 };
-const PRIO_LABEL = { P0: '즉시 대응', P1: '높음', P2: '보통', P3: '낮음' };
+const PRIO_LABEL = { P0: '즉시 대응', P1: '높음', P2: '보통', P3: '낮음' }; // P0~P3는 내부 값, 화면에는 한글만
 const PRIO_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 };
-const OPEN_STATUSES = ['접수', '진행 예정', '진행 중', '보류'];
+const OPEN_STATUSES = ['접수', '백로그', '기획·디자인', '개발 대기', '개발', 'QA', '배포 대기', '보류'];
 const NEEDS_REASON = ['보류', '반려'];
-const TASK_STATUSES = ['할 일', '진행 중', '리뷰', '완료'];
+const UPCOMING = ['계획', '개발 중', 'QA', '배포 대기'];
 
 const app = document.getElementById('app');
 const $ = (s, el = document) => el.querySelector(s);
@@ -64,35 +62,25 @@ const rank = (p) => (p in PRIO_RANK ? PRIO_RANK[p] : 9);
 const byPriority = (a, b) => rank(a.priority) - rank(b.priority) || new Date(a.createdAt) - new Date(b.createdAt);
 const userName = (id) => (S.usersById[id] ? S.usersById[id].name : id || '');
 const names = (ids) => (ids || []).map(userName).join(', ');
-const sumPts = (list) => list.reduce((s, t) => s + (Number(t.points) || 0), 0);
+const vName = (s) => (/^\d+\.\d+/.test(s || '') ? 'v' + s : s || ''); // 2.3.0 → v2.3.0, 2026-11은 그대로
+const vLabel = (v) => `${v.platform} ${vName(v.version)}`;
 
 const statusBadge = (s) => `<span class="badge ${STATUS_CLASS[s] || ''}"><span class="dot"></span>${esc(s)}</span>`;
-const prioBadge = (p) => (p ? `<span class="prio prio-${p}" title="${PRIO_LABEL[p]}">${p}</span>` : '<span class="prio prio-none" title="우선순위 미정">–</span>');
+const prioBadge = (p) => (p ? `<span class="prio prio-${p}">${PRIO_LABEL[p]}</span>` : '<span class="prio prio-none">미정</span>');
 const lvBadge = (l) => `<span class="lv lv-${esc(l)}">${esc(l)}</span>`;
 const tags = (list) => (list || []).map((x) => `<span class="tag">${esc(x)}</span>`).join('');
-const ptsBadge = (p) => (p === null || p === undefined ? '<span class="pts none" title="스토리 포인트 미정">–</span>' : `<span class="pts" title="스토리 포인트">${esc(p)}</span>`);
-function avatar(id, cls = '') {
-  if (!id) return `<span class="avatar unassigned ${cls}" title="담당자 없음">·</span>`;
-  const n = userName(id);
-  return `<span class="avatar ${cls}" title="${esc(n)}">${esc(n.slice(0, 1))}</span>`;
-}
-function epicTag(epicId) {
-  const e = S.work.epics.find((x) => x.id === epicId);
-  if (!e) return '<span></span>';
-  return `<span class="epic-tag" title="${esc(e.key)} ${esc(e.title)}"><i style="background:${esc(e.color)}"></i><b>${esc(e.title)}</b></span>`;
-}
+const versionTags = (vs) => (vs || []).map((v) => `<span class="vtag${v.status === '배포 완료' ? ' shipped' : ''}" title="${esc(v.status)}">${esc(v.platform)} <b>${esc(vName(v.version))}</b></span>`).join('');
 
-// 시그니처: 상태별 스토리 포인트 막대
-function meterHtml(tasks, { size = '', legend = true, by = 'points' } = {}) {
-  const val = (t) => (by === 'count' ? 1 : Number(t.points) || 0);
-  const parts = ['완료', '리뷰', '진행 중', '할 일'].map((st) => ({ st, v: tasks.filter((t) => t.status === st).reduce((s, t) => s + val(t), 0) }));
-  const total = parts.reduce((s, p) => s + p.v, 0);
-  const done = parts[0].v;
-  const pct = total ? Math.round((done / total) * 100) : 0;
-  const unit = by === 'count' ? '개' : 'pt';
-  const segs = total ? parts.filter((p) => p.v).map((p) => `<span class="seg-${p.st.replace(' ', '')}" style="width:${(p.v / total) * 100}%" title="${p.st} ${p.v}${unit}"></span>`).join('') : '';
-  return `<div class="meter ${size}" role="img" aria-label="완료 ${pct}% (${done}/${total}${unit})"><div class="bar">${segs}</div>${legend ? `<div class="legend">${parts
-    .map((p) => `<span><i class="seg-${p.st.replace(' ', '')}"></i>${p.st} ${p.v}${unit}</span>`).join('')}<span class="pct">${pct}% 완료</span></div>` : ''}</div>`;
+// 요청 진행 막대: 버전에 담긴 요청이 어디까지 왔는지
+function reqMeter(reqs, { legend = true, size = 'mini' } = {}) {
+  // 보드 칸을 네 묶음으로: 완료 / 검증·배포 대기 / 진행 중 / 대기
+  const order = [['완료', '완료', ['완료']], ['검증·배포 대기', '리뷰', ['QA', '배포 대기']], ['진행 중', '진행중', ['기획·디자인', '개발 대기', '개발']], ['대기', '접수', ['접수', '백로그', '보류']]];
+  const parts = order.map(([st, cls, sts]) => ({ st, cls, n: reqs.filter((r) => sts.includes(r.status)).length }));
+  const total = reqs.length;
+  const done = parts[0].n;
+  const segs = total ? parts.filter((p) => p.n).map((p) => `<span class="seg-${p.cls}" style="width:${(p.n / total) * 100}%" title="${p.st} ${p.n}건"></span>`).join('') : '';
+  return `<div class="meter ${size}" role="img" aria-label="요청 ${total}건 중 ${done}건 완료"><div class="bar">${segs}</div>${legend ? `<div class="legend">${parts
+    .filter((p) => p.n).map((p) => `<span><i class="seg-${p.cls}"></i>${p.st} ${p.n}</span>`).join('')}<span class="pct">${done}/${total} 완료</span></div>` : ''}</div>`;
 }
 
 let toastTimer;
@@ -111,7 +99,9 @@ async function api(method, url, body) {
     opt.headers['Content-Type'] = 'application/json';
     opt.body = JSON.stringify(body);
   }
-  const r = await fetch(url, opt);
+  let r;
+  try { r = await fetch(url, opt); }
+  catch { throw new Error('서버에 연결하지 못했어요. 서버 창이 켜져 있는지 확인해 주세요.'); }
   let data = null;
   try { data = await r.json(); } catch { /* 본문 없음 */ }
   if (r.status === 401 && url !== '/api/login') {
@@ -124,20 +114,17 @@ async function api(method, url, body) {
 }
 
 async function refresh() {
-  const jobs = [api('GET', '/api/requests'), api('GET', '/api/users'), api('GET', '/api/me')];
-  if (has('work.view')) jobs.push(api('GET', '/api/work'));
-  const [reqs, users, me, work] = await Promise.all(jobs);
+  const [reqs, users, me, versions] = await Promise.all([api('GET', '/api/requests'), api('GET', '/api/users'), api('GET', '/api/me'), api('GET', '/api/versions')]);
   S.requests = reqs;
   S.users = users;
   S.usersById = Object.fromEntries(users.map((u) => [u.memberId, u]));
+  S.versions = versions;
   const permsChanged = me.perms.join() !== S.me.perms.join();
   S.me = me;
-  if (work) S.work = work;
   if (permsChanged) renderShell();
   updateSide();
 }
 const refreshSafe = () => refresh().catch((e) => toast(e.message, true));
-const activeSprint = () => S.work.sprints.find((s) => s.state === 'active');
 
 // ───────────────────────── 로그인 (통합계정 SSO) ─────────────────────────
 const mockBanner = () =>
@@ -149,7 +136,7 @@ function renderLogin(msg = '') {
   closeModal();
   app.innerHTML = `${mockBanner()}
   <div class="login"><div class="login-card panel">
-    <div class="brand"><span class="logo"></span><div><b>요청 창구</b><small>기획 · 개발 · 디자인 요청과 작업</small></div></div>
+    <div class="brand"><span class="logo"></span><div><b>요청 창구</b><small>기획 · 개발 · 디자인 요청과 배포</small></div></div>
     <div><h1>로그인</h1><p class="muted" style="margin-top:4px">통합계정 아이디와 비밀번호를 입력해 주세요.</p></div>
     <form id="login-form">
       <div class="field"><label class="label" for="lg-id">아이디</label><input class="input" id="lg-id" autocomplete="username" required></div>
@@ -202,7 +189,6 @@ function roleName() {
 
 function renderShell() {
   const me = S.me;
-  const scrollY = window.scrollY;
   app.innerHTML = `${mockBanner()}
   <div class="layout${S.meta.ssoMode === 'mock' ? ' with-banner' : ''}">
     <aside class="side">
@@ -213,15 +199,11 @@ function renderShell() {
         <a href="#/board" data-nav="board">요청 보드</a>
         <a href="#/list" data-nav="list">요청 목록</a>
         ${has('request.triage') ? '<a href="#/triage" data-nav="triage">우선순위 회의 <span class="count" id="triage-count" hidden></span></a>' : ''}
-        ${has('work.view') ? `<div class="group">작업 관리</div>
-          <a href="#/sprint" data-nav="sprint">스프린트 보드</a>
-          <a href="#/backlog" data-nav="backlog">백로그</a>
-          <a href="#/epics" data-nav="epics">에픽</a>` : ''}
-        <div class="group">기타</div>
-        <a href="#/versions" data-nav="versions">버전 관리 <span class="soon">준비 중</span></a>
-        ${has('admin') ? '<a href="#/notifications" data-nav="notifications">알림 기록</a><a href="#/admin" data-nav="admin">권한 관리</a>' : ''}
+        <div class="group">배포</div>
+        <a href="#/versions" data-nav="versions">버전 관리</a>
+        ${has('admin') ? '<div class="group">관리</div><a href="#/notifications" data-nav="notifications">알림 기록</a><a href="#/admin" data-nav="admin">권한 관리</a>' : ''}
       </nav>
-      <a class="side-sprint" id="side-sprint" href="#/sprint" hidden></a>
+      <div class="side-next" id="side-next" hidden></div>
       <div class="me">
         <span class="avatar">${me.photoUrl ? `<img src="${esc(me.photoUrl)}" alt="">` : esc(me.name.slice(0, 1))}</span>
         <div class="who"><b>${esc(me.name)}</b><small>${esc(me.team || '-')} · ${esc(roleName())}</small></div>
@@ -237,9 +219,10 @@ function renderShell() {
     S.me = null;
     renderLogin();
   };
-  if (S.lastView && started) { renderView(S.lastView); window.scrollTo(0, scrollY); }
+  if (S.lastView && started) renderView(S.lastView);
 }
 
+// 사이드바: 플랫폼별 다음 배포
 function updateSide() {
   const c = $('#triage-count');
   if (c) {
@@ -247,20 +230,23 @@ function updateSide() {
     c.textContent = n;
     c.hidden = !n;
   }
-  const box = $('#side-sprint');
+  const box = $('#side-next');
   if (!box) return;
-  const sp = has('work.view') && activeSprint();
-  if (!sp) { box.hidden = true; return; }
-  const tasks = S.work.tasks.filter((t) => t.sprintId === sp.id);
-  const left = sp.endDate ? daysLeft(sp.endDate) : null;
-  box.hidden = false;
-  box.innerHTML = `<div class="t"><span>${esc(sp.name)}</span><span class="mono">${left === null ? '' : left >= 0 ? `D-${left}` : `${-left}일 지남`}</span></div>${meterHtml(tasks, { size: 'mini', legend: false })}`;
+  const rows = S.meta.enums.versionPlatforms.map((p) => {
+    const next = S.versions.filter((v) => v.platform === p && UPCOMING.includes(v.status))
+      .sort((a, b) => (a.plannedDate || '9999').localeCompare(b.plannedDate || '9999'))[0];
+    if (!next) return '';
+    const d = next.plannedDate ? dueText(next.plannedDate) : '날짜 미정';
+    return `<a href="#/v/${next.id}"><span class="p">${esc(p)}</span><span class="mono">${esc(vName(next.version))}</span><span class="d">${esc(d)}</span></a>`;
+  }).join('');
+  box.hidden = !rows;
+  box.innerHTML = rows ? `<div class="h">다음 배포</div>${rows}` : '';
 }
 
 // ───────────────────────── 라우팅 ─────────────────────────
 function parseHash() {
   const [a, b] = location.hash.replace(/^#\/?/, '').split('/');
-  if ((a === 'r' || a === 't') && /^\d+$/.test(b || '')) return { view: 'detail', kind: a, id: Number(b) };
+  if ((a === 'r' || a === 'v') && /^\d+$/.test(b || '')) return { view: 'detail', kind: a, id: Number(b) };
   if (VIEWS[a]) return { view: a };
   return { view: 'board' };
 }
@@ -270,9 +256,6 @@ const VIEWS = {
   list: { fn: () => viewList },
   triage: { fn: () => viewTriage, perm: 'request.triage' },
   new: { fn: () => viewNew },
-  sprint: { fn: () => viewSprint, perm: 'work.view' },
-  backlog: { fn: () => viewBacklog, perm: 'work.view' },
-  epics: { fn: () => viewEpics, perm: 'work.view' },
   versions: { fn: () => viewVersions },
   notifications: { fn: () => viewNotifications, perm: 'admin' },
   admin: { fn: () => viewAdmin, perm: 'admin' },
@@ -293,9 +276,10 @@ async function route() {
   closeModal();
   if (r.view === 'detail') {
     S.detail = { kind: r.kind, id: r.id };
+    if (!$('#main').dataset.view && r.kind === 'v') S.lastView = 'versions'; // 링크로 바로 들어오면 뒤에 버전 화면을 깔아요
     if ($('#main').dataset.view !== S.lastView) { await refreshSafe(); renderView(S.lastView); }
     if (r.kind === 'r') openRequestDrawer(r.id);
-    else openTaskDrawer(r.id);
+    else openVersionDrawer(r.id);
     return;
   }
   S.detail = null;
@@ -321,13 +305,13 @@ async function startApp() {
 
 // 입력 중이 아닌 화면만 주기적으로 새로 그림
 async function poll() {
-  if (document.hidden || !S.me || S.detail || S.dragging || $('#modal-root .modal')) return;
+  if (document.hidden || !S.me || S.detail || $('#modal-root .modal')) return;
   const v = S.lastView;
-  if (!['board', 'list', 'sprint', 'backlog', 'epics'].includes(v)) return;
+  if (!['board', 'list', 'versions'].includes(v)) return;
   if (document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
   try {
     await refresh();
-    if (S.detail || S.lastView !== v || S.dragging) return;
+    if (S.detail || S.lastView !== v) return;
     if (v === 'list') renderListResults();
     else renderView(v);
   } catch { /* 다음 주기에 다시 */ }
@@ -337,10 +321,10 @@ async function poll() {
 function openModal(html, onMount) {
   const root = $('#modal-root');
   root.innerHTML = `<div class="overlay" data-mclose></div><div class="modal" role="dialog" aria-modal="true">${html}</div>`;
-  $$('[data-mclose]', root).forEach((b) => (b.onclick = closeModal));
+  $$('[data-mclose]', root).forEach((b) => (b.onclick = (e) => { e.preventDefault(); closeModal(); }));
   const m = $('.modal', root);
   if (onMount) onMount(m);
-  const first = $('input:not([type=hidden]),textarea,select', m);
+  const first = $('input:not([type=hidden]):not([type=radio]),textarea,select', m);
   if (first) first.focus();
   return m;
 }
@@ -373,14 +357,6 @@ function chipGroup(name, opts, type, cls = '', selected = []) {
   return opts.map((o) => `<label class="chip${cls ? ` ${cls}-${esc(o)}` : ''}"><input type="${type}" name="${name}" value="${esc(o)}" ${selected.includes(o) ? 'checked' : ''}><span>${esc(o)}</span></label>`).join('');
 }
 
-function userOptions(selected, emptyLabel = '담당자 없음') {
-  const groups = {};
-  S.users.forEach((u) => (groups[u.job || '기타'] = groups[u.job || '기타'] || []).push(u));
-  const order = ['기획', '개발', '디자인', ...Object.keys(groups).filter((k) => !['기획', '개발', '디자인'].includes(k))];
-  return `<option value="">${esc(emptyLabel)}</option>` + order.filter((g) => groups[g]).map((g) => `<optgroup label="${esc(g)}">${groups[g]
-    .map((u) => `<option value="${esc(u.memberId)}" ${u.memberId === selected ? 'selected' : ''}>${esc(u.name)}</option>`).join('')}</optgroup>`).join('');
-}
-
 function assigneePicker(selected) {
   const groups = {};
   S.users.forEach((u) => (groups[u.job || '기타'] = groups[u.job || '기타'] || []).push(u));
@@ -388,7 +364,7 @@ function assigneePicker(selected) {
   const body = order.filter((g) => groups[g]).map((g) => `<div class="pg-h">${esc(g)}</div>${groups[g]
     .map((u) => `<label><input type="checkbox" value="${esc(u.memberId)}" ${selected.includes(u.memberId) ? 'checked' : ''}> ${esc(u.name)} <small>${esc(u.team)}</small></label>`).join('')}`).join('');
   return `<details class="picker"><summary>${pickerLabel(selected)}</summary><div class="picker-menu">${
-    body || '<div class="muted" style="padding:8px">한 번 이상 로그인한 작업자만 고를 수 있어요.</div>'}</div></details>`;
+    body || '<div class="muted" style="padding:8px">한 번 이상 로그인한 처리 담당자만 고를 수 있어요.</div>'}</div></details>`;
 }
 const pickerLabel = (ids) => (ids.length ? esc(names(ids)) : '<span class="muted">담당자 선택</span>');
 const pickerValue = (root) => $$('.picker input:checked', root).map((i) => i.value);
@@ -417,7 +393,7 @@ document.addEventListener('paste', (e) => {
 // ───────────────────────── 시작 ─────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
   try { S.meta = await fetch('/api/meta').then((r) => r.json()); }
-  catch { app.innerHTML = '<div class="boot">서버에 연결하지 못했어요. 서버가 켜져 있는지 확인해 주세요.</div>'; return; }
+  catch { app.innerHTML = '<div class="boot">서버에 연결하지 못했어요. 서버 창이 켜져 있는지 확인해 주세요.</div>'; return; }
   const r = await fetch('/api/me', { credentials: 'same-origin' });
   if (!r.ok) return renderLogin();
   S.me = await r.json();
