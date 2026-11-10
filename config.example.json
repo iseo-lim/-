@@ -1,0 +1,51 @@
+{
+  "port": 8080,
+  "baseUrl": "http://localhost:8080",
+  "sessionHours": 12,
+  "boardShowsAllTeams": true,
+
+  "sso": {
+    "mode": "mock",
+    "baseUrl": "https://api-enterprise-member-manage.xyzcorp.io"
+  },
+
+  "admins": [],
+
+  "groupMap": {
+    "REQ_ADMIN":     { "team": "기획팀",   "job": "기획",   "role": "admin" },
+    "REQ_LEAD":      { "team": "개발팀",   "job": "개발",   "role": "lead" },
+    "REQ_PLAN":      { "team": "기획팀",   "job": "기획",   "role": "member" },
+    "REQ_DEV":       { "team": "개발팀",   "job": "개발",   "role": "member" },
+    "REQ_DESIGN":    { "team": "디자인팀", "job": "디자인", "role": "member" },
+    "REQ_OPS_LEAD":  { "team": "운영팀",   "job": "운영",   "role": "opsLead" },
+    "REQ_OPS":       { "team": "운영팀",   "job": "운영",   "role": "requester" },
+    "REQ_CS":        { "team": "CS팀",     "job": "운영",   "role": "requester" }
+  },
+
+  "github": {
+    "token": "",
+    "apiUrl": "https://api.github.com",
+    "defaultRepo": "",
+    "repoByPlatform": {},
+    "repos": [],
+    "pollSeconds": 60
+  },
+
+  "slack": {
+    "webhookUrl": "",
+    "botToken": ""
+  },
+
+  "mockUsers": [
+    { "memberId": "admin",   "memberName": "강관리",   "email": "admin@example.com",   "permGroupIds": ["REQ_ADMIN"] },
+    { "memberId": "lead1",   "memberName": "서리드",   "email": "lead1@example.com",   "permGroupIds": ["REQ_LEAD"] },
+    { "memberId": "plan1",   "memberName": "이기획",   "email": "plan1@example.com",   "permGroupIds": ["REQ_PLAN"] },
+    { "memberId": "dev1",    "memberName": "김개발",   "email": "dev1@example.com",    "permGroupIds": ["REQ_DEV"] },
+    { "memberId": "dev2",    "memberName": "한백엔드", "email": "dev2@example.com",    "permGroupIds": ["REQ_DEV"] },
+    { "memberId": "design1", "memberName": "박디자인", "email": "design1@example.com", "permGroupIds": ["REQ_DESIGN"] },
+    { "memberId": "opslead", "memberName": "윤운영",   "email": "opslead@example.com", "permGroupIds": ["REQ_OPS_LEAD"] },
+    { "memberId": "ops1",    "memberName": "최운영",   "email": "ops1@example.com",    "permGroupIds": ["REQ_OPS"] },
+    { "memberId": "cs1",     "memberName": "정상담",   "email": "cs1@example.com",     "permGroupIds": ["REQ_CS"] },
+    { "memberId": "guest",   "memberName": "권한없음", "email": "guest@example.com",   "permGroupIds": ["SALES_VIEWER"] }
+  ]
+}

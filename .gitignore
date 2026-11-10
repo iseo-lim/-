@@ -1,0 +1,5 @@
+config.json
+data/
+data-*/
+node_modules/
+Manual for Integration work.md
